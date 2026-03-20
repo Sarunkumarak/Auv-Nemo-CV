@@ -17,24 +17,14 @@ cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
 
 if not cap.isOpened():
     print("[ERROR] Camera failed to open — check /dev/video0 exists")
-    print("        Run: ls /dev/video*")
     exit(1)
 else:
-    print(f"[INFO] Camera opened — {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+    print(f"[INFO] Camera opened — "
+          f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
           f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
 
 # ─────────────────────────────────────────────
-#  QR DETECTOR
-# ─────────────────────────────────────────────
-try:
-    qr_detector = cv2.QRCodeDetectorAruco()
-    print("[INFO] QRCodeDetectorAruco loaded")
-except AttributeError:
-    qr_detector = cv2.QRCodeDetector()
-    print("[INFO] QRCodeDetector (fallback) loaded")
-
-# ─────────────────────────────────────────────
-#  ARUCO
+#  ARUCO SETUP
 # ─────────────────────────────────────────────
 ARUCO_DICTS = [
     aruco.DICT_4X4_1000,
@@ -64,7 +54,7 @@ aruco_detectors = [
 ]
 
 # ─────────────────────────────────────────────
-#  APRILTAG
+#  APRILTAG SETUP
 # ─────────────────────────────────────────────
 apriltag_detector = Detector(families="tag36h11")
 
@@ -74,7 +64,6 @@ apriltag_detector = Detector(families="tag36h11")
 clahe     = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 gamma_lut = np.array([((i / 255.0) ** (1.0 / 1.8)) * 255
                       for i in range(256)], dtype=np.uint8)
-
 SHARPEN_KERNEL = np.array([[ 0, -1,  0],
                             [-1,  5, -1],
                             [ 0, -1,  0]], dtype=np.float32)
@@ -108,11 +97,12 @@ NIGHT_THRESHOLD     = 80
 MIN_MARKER_AREA     = 2000
 MIN_QR_AREA         = 1500
 QR_RESULT_TTL       = 0.4
+MARKER_RESULT_TTL   = 0.12   # ArUco / AprilTag freshness
 SPATIAL_MERGE_DIST  = 80
 ALIGNMENT_THRESHOLD = 30
 
 # ─────────────────────────────────────────────
-#  SHARED DISPLAY FRAMES (thread → main)
+#  SHARED DISPLAY FRAMES
 # ─────────────────────────────────────────────
 display_lock         = threading.Lock()
 shared_balloon_mask  = None
@@ -125,12 +115,157 @@ last_qr_result      = None
 last_qr_ts          = 0.0
 last_balloon_result = None
 last_balloon_ts     = 0.0
+last_marker_result  = None   # ArUco / AprilTag combined
+last_marker_ts      = 0.0
 last_target         = None
 lost_frames         = 0
 
 # ─────────────────────────────────────────────
-#  QR BACKGROUND THREAD
+#  HELPERS
 # ─────────────────────────────────────────────
+def is_valid_marker(pts):
+    area = cv2.contourArea(pts.astype(np.float32))
+    if area < MIN_MARKER_AREA:
+        return False
+    sides = [np.linalg.norm(pts[(i+1) % 4] - pts[i]) for i in range(4)]
+    mean  = np.mean(sides)
+    if mean == 0:
+        return False
+    if np.any(np.abs(sides - mean) / mean > 0.40):
+        return False
+    rect = cv2.minAreaRect(pts.astype(np.float32))
+    rw, rh = rect[1]
+    if min(rw, rh) == 0:
+        return False
+    if max(rw, rh) / min(rw, rh) > 1.6:
+        return False
+    return True
+
+def is_balloon_contour(cnt, min_circularity=0.65):
+    area  = cv2.contourArea(cnt)
+    perim = cv2.arcLength(cnt, True)
+    if perim == 0:
+        return False
+    return (4 * np.pi * area / (perim ** 2)) > min_circularity
+
+def white_balance(img):
+    result              = img.astype(np.float32)
+    avg_b, avg_g, avg_r = (np.mean(result[:, :, c]) for c in range(3))
+    avg_gray            = (avg_b + avg_g + avg_r) / 3
+    result[:, :, 0]    *= avg_gray / (avg_b + 1e-6)
+    result[:, :, 1]    *= avg_gray / (avg_g + 1e-6)
+    result[:, :, 2]    *= avg_gray / (avg_r + 1e-6)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+# ─────────────────────────────────────────────
+#  THREAD 1 — ARUCO + APRILTAG
+# ─────────────────────────────────────────────
+marker_input_queue  = queue.Queue(maxsize=1)
+marker_result_queue = queue.Queue(maxsize=1)
+
+def marker_worker():
+    while True:
+        try:
+            gray, enhanced = marker_input_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        result = None
+
+        # ── ArUco ──
+        all_detections = []
+        for det_i, aruco_detector in enumerate(aruco_detectors):
+            corners, ids, _ = aruco_detector.detectMarkers(enhanced)
+            if ids is None:
+                corners, ids, _ = aruco_detector.detectMarkers(gray)
+            if ids is None or len(ids) == 0:
+                continue
+            for i in range(len(ids)):
+                c = corners[i][0]
+                if not is_valid_marker(c):
+                    continue
+                area = cv2.contourArea(c)
+                tx   = int(c[:, 0].mean())
+                ty   = int(c[:, 1].mean())
+                all_detections.append((
+                    ARUCO_DICT_PRIORITY[det_i], area, tx, ty,
+                    int(ids[i][0]), ARUCO_DICT_NAMES[det_i],
+                    corners[i].copy(), ids[i].copy()
+                ))
+
+        if all_detections:
+            used   = [False] * len(all_detections)
+            groups = []
+            for i in range(len(all_detections)):
+                if used[i]:
+                    continue
+                group   = [i]
+                used[i] = True
+                for j in range(i + 1, len(all_detections)):
+                    if used[j]:
+                        continue
+                    dist = ((all_detections[i][2] - all_detections[j][2]) ** 2 +
+                            (all_detections[i][3] - all_detections[j][3]) ** 2) ** 0.5
+                    if dist < SPATIAL_MERGE_DIST:
+                        group.append(j)
+                        used[j] = True
+                groups.append(group)
+
+            best_detection, best_score = None, (-1, -1)
+            for group in groups:
+                for idx in group:
+                    pri, area = all_detections[idx][0], all_detections[idx][1]
+                    if (pri, area) > best_score:
+                        best_score     = (pri, area)
+                        best_detection = all_detections[idx]
+
+            if best_detection:
+                _, area, tx, ty, aruco_id, dict_name, corner, aid = best_detection
+                result = {
+                    "type":     "ARUCO",
+                    "tx": tx, "ty": ty,
+                    "label":    f"ArUco {dict_name}:{aruco_id}",
+                    "source":   f"ARUCO-{dict_name}",
+                    "aruco_id": aruco_id,
+                    "corner":   corner,
+                    "aid":      aid,
+                }
+                print(f"[ArUco-{dict_name}] ID:{aruco_id}  X:{tx}  Y:{ty}")
+
+        # ── AprilTag (only if ArUco failed) ──
+        if result is None:
+            tags = apriltag_detector.detect(enhanced)
+            for tag in tags:
+                tx = int(tag.center[0])
+                ty = int(tag.center[1])
+                result = {
+                    "type":   "APRIL",
+                    "tx": tx, "ty": ty,
+                    "label":  f"April {tag.tag_id}",
+                    "source": "APRIL",
+                }
+                print(f"[AprilTag] ID:{tag.tag_id}  X:{tx}  Y:{ty}")
+                break
+
+        if not marker_result_queue.full():
+            marker_result_queue.put((result, time.monotonic()))
+        else:
+            try:
+                marker_result_queue.get_nowait()
+            except queue.Empty:
+                pass
+            marker_result_queue.put((result, time.monotonic()))
+
+# ─────────────────────────────────────────────
+#  THREAD 2 — QR
+# ─────────────────────────────────────────────
+try:
+    qr_detector = cv2.QRCodeDetectorAruco()
+    print("[INFO] QRCodeDetectorAruco loaded")
+except AttributeError:
+    qr_detector = cv2.QRCodeDetector()
+    print("[INFO] QRCodeDetector (fallback) loaded")
+
 qr_input_queue  = queue.Queue(maxsize=1)
 qr_result_queue = queue.Queue(maxsize=1)
 
@@ -138,8 +273,7 @@ def preprocess_for_qr(gray):
     sharp = cv2.filter2D(gray, -1, SHARPEN_KERNEL)
     return cv2.adaptiveThreshold(
         sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 11, 2
-    )
+        cv2.THRESH_BINARY, 11, 2)
 
 def try_detect_qr(img, cx, cy):
     result = None
@@ -183,7 +317,8 @@ def qr_worker():
             continue
         result = try_detect_qr(gray, cx, cy)
         if result is None:
-            result = try_detect_qr(cv2.filter2D(gray, -1, SHARPEN_KERNEL), cx, cy)
+            result = try_detect_qr(
+                cv2.filter2D(gray, -1, SHARPEN_KERNEL), cx, cy)
         if result is None:
             result = try_detect_qr(clahe.apply(gray), cx, cy)
         if result is None:
@@ -204,28 +339,21 @@ def qr_worker():
             qr_result_queue.put((result, time.monotonic()))
 
 # ─────────────────────────────────────────────
-#  BALLOON BACKGROUND THREAD
+#  THREAD 3 — BALLOON
 # ─────────────────────────────────────────────
 balloon_input_queue  = queue.Queue(maxsize=1)
 balloon_result_queue = queue.Queue(maxsize=1)
-
-def is_balloon_contour(cnt, min_circularity=0.65):
-    area  = cv2.contourArea(cnt)
-    perim = cv2.arcLength(cnt, True)
-    if perim == 0:
-        return False
-    return (4 * np.pi * area / (perim ** 2)) > min_circularity
 
 def balloon_worker():
     global shared_balloon_mask, shared_balloon_edges
 
     while True:
         try:
-            frame_small, scale, full_w, full_h = balloon_input_queue.get(timeout=1.0)
+            frame_small, scale, full_w, full_h = \
+                balloon_input_queue.get(timeout=1.0)
         except queue.Empty:
             continue
 
-        # ── Lightweight preprocessing ──
         blurred = cv2.GaussianBlur(frame_small, (5, 5), 0)
         hsv     = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
         gray_s  = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
@@ -240,7 +368,6 @@ def balloon_worker():
         for color_name, ranges in COLOR_RANGES.items():
             if early_exit:
                 break
-
             mask = None
             for lower, upper in ranges:
                 temp = cv2.inRange(hsv, lower, upper)
@@ -279,9 +406,8 @@ def balloon_worker():
             else np.zeros((frame_small.shape[0], frame_small.shape[1]),
                           dtype=np.uint8),
             (full_w, full_h), interpolation=cv2.INTER_NEAREST)
-
-        edges_full = cv2.resize(edges_s, (full_w, full_h),
-                                interpolation=cv2.INTER_NEAREST)
+        edges_full = cv2.resize(
+            edges_s, (full_w, full_h), interpolation=cv2.INTER_NEAREST)
 
         with display_lock:
             shared_balloon_mask  = mask_full
@@ -307,34 +433,15 @@ def balloon_worker():
             balloon_result_queue.put((result, time.monotonic()))
 
 # ─────────────────────────────────────────────
-#  HELPERS
-# ─────────────────────────────────────────────
-def is_valid_marker(pts):
-    area = cv2.contourArea(pts.astype(np.float32))
-    if area < MIN_MARKER_AREA:
-        return False
-    sides = [np.linalg.norm(pts[(i+1) % 4] - pts[i]) for i in range(4)]
-    mean  = np.mean(sides)
-    if mean == 0:
-        return False
-    if np.any(np.abs(sides - mean) / mean > 0.40):
-        return False
-    rect = cv2.minAreaRect(pts.astype(np.float32))
-    rw, rh = rect[1]
-    if min(rw, rh) == 0:
-        return False
-    if max(rw, rh) / min(rw, rh) > 1.6:
-        return False
-    return True
-
-# ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
 def main():
-    global last_qr_result, last_qr_ts
+    global last_qr_result,      last_qr_ts
     global last_balloon_result, last_balloon_ts
+    global last_marker_result,  last_marker_ts
     global last_target, lost_frames
 
+    threading.Thread(target=marker_worker,  daemon=True).start()
     threading.Thread(target=qr_worker,      daemon=True).start()
     threading.Thread(target=balloon_worker, daemon=True).start()
 
@@ -343,13 +450,14 @@ def main():
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("[ERROR] Failed to grab frame — camera disconnected?")
+            print("[ERROR] Failed to grab frame")
             break
 
         h, w   = frame.shape[:2]
         cx, cy = w // 2, h // 2
         now    = time.monotonic()
 
+        # ── Minimal main-thread prep ──
         gray       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         brightness = cv2.mean(gray)[0]
 
@@ -360,121 +468,46 @@ def main():
             enhanced = cv2.equalizeHist(gray)
             mode     = "DAY"
 
-        detected      = None
-        detect_source = ""
-        marker_found  = False
-
         # ════════════════════════════════════════════════════════════
-        #  1. ARUCO
+        #  FEED ALL THREADS (non-blocking, drop if busy)
         # ════════════════════════════════════════════════════════════
-        all_detections = []
-        for det_i, aruco_detector in enumerate(aruco_detectors):
-            corners, ids, _ = aruco_detector.detectMarkers(enhanced)
-            if ids is None:
-                corners, ids, _ = aruco_detector.detectMarkers(gray)
-            if ids is None or len(ids) == 0:
-                continue
-            for i in range(len(ids)):
-                c = corners[i][0]
-                if not is_valid_marker(c):
-                    continue
-                area = cv2.contourArea(c)
-                tx   = int(c[:, 0].mean())
-                ty   = int(c[:, 1].mean())
-                all_detections.append((
-                    ARUCO_DICT_PRIORITY[det_i], area, tx, ty,
-                    int(ids[i][0]), ARUCO_DICT_NAMES[det_i],
-                    corners[i], ids[i]
-                ))
-
-        if all_detections:
-            used   = [False] * len(all_detections)
-            groups = []
-            for i in range(len(all_detections)):
-                if used[i]:
-                    continue
-                group   = [i]
-                used[i] = True
-                for j in range(i + 1, len(all_detections)):
-                    if used[j]:
-                        continue
-                    dist = ((all_detections[i][2] - all_detections[j][2]) ** 2 +
-                            (all_detections[i][3] - all_detections[j][3]) ** 2) ** 0.5
-                    if dist < SPATIAL_MERGE_DIST:
-                        group.append(j)
-                        used[j] = True
-                groups.append(group)
-
-            best_detection, best_score = None, (-1, -1)
-            for group in groups:
-                for idx in group:
-                    pri, area = all_detections[idx][0], all_detections[idx][1]
-                    if (pri, area) > best_score:
-                        best_score     = (pri, area)
-                        best_detection = all_detections[idx]
-
-            if best_detection:
-                _, area, tx, ty, aruco_id, dict_name, corner, aid = best_detection
-                detected      = (tx, ty, f"ArUco {dict_name}:{aruco_id}")
-                detect_source = f"ARUCO-{dict_name}"
-                marker_found  = True
-                aruco.drawDetectedMarkers(frame, [corner], np.array([[aruco_id]]))
-                print(f"[ArUco-{dict_name}] ID:{aruco_id}  X:{tx}  Y:{ty}")
-
-        # ════════════════════════════════════════════════════════════
-        #  2. APRILTAG
-        # ════════════════════════════════════════════════════════════
-        if not marker_found:
-            tags = apriltag_detector.detect(enhanced)
-            for tag in tags:
-                tx, ty        = int(tag.center[0]), int(tag.center[1])
-                detected      = (tx, ty, f"April {tag.tag_id}")
-                detect_source = "APRIL"
-                marker_found  = True
-                print(f"[AprilTag] ID:{tag.tag_id}  X:{tx}  Y:{ty}")
-                break
-
-        # ════════════════════════════════════════════════════════════
-        #  3. QR
-        # ════════════════════════════════════════════════════════════
-        if not marker_found:
-            if qr_input_queue.empty():
-                try:
-                    qr_input_queue.put_nowait((gray.copy(), cx, cy))
-                except queue.Full:
-                    pass
+        if marker_input_queue.empty():
             try:
-                qr_res, qr_ts  = qr_result_queue.get_nowait()
-                last_qr_result = qr_res
-                last_qr_ts     = qr_ts
-            except queue.Empty:
+                marker_input_queue.put_nowait(
+                    (gray.copy(), enhanced.copy()))
+            except queue.Full:
                 pass
 
-            if last_qr_result is not None and (now - last_qr_ts) < QR_RESULT_TTL:
-                tx, ty, data, pts = last_qr_result
-                detected      = (tx, ty, f"QR:{data}")
-                detect_source = "QR"
-                marker_found  = True
-                for i in range(len(pts)):
-                    cv2.line(frame, tuple(pts[i]),
-                             tuple(pts[(i + 1) % len(pts)]), (0, 255, 0), 2)
-                cv2.putText(frame, f"{data[:30]}", (tx - 20, ty + 45),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
-                print(f"[QR] Data:{data}  X:{tx}  Y:{ty}")
-            else:
-                if (now - last_qr_ts) >= QR_RESULT_TTL:
-                    last_qr_result = None
+        if qr_input_queue.empty():
+            try:
+                qr_input_queue.put_nowait((gray.copy(), cx, cy))
+            except queue.Full:
+                pass
 
-        # ════════════════════════════════════════════════════════════
-        #  4. BALLOON — always feed thread every frame
-        # ════════════════════════════════════════════════════════════
         if balloon_input_queue.empty():
             try:
-                small = cv2.resize(frame, (0, 0),
-                                   fx=BALLOON_SCALE, fy=BALLOON_SCALE)
+                small = cv2.resize(
+                    frame, (0, 0), fx=BALLOON_SCALE, fy=BALLOON_SCALE)
                 balloon_input_queue.put_nowait((small, BALLOON_SCALE, w, h))
             except queue.Full:
                 pass
+
+        # ════════════════════════════════════════════════════════════
+        #  COLLECT RESULTS (non-blocking)
+        # ════════════════════════════════════════════════════════════
+        try:
+            m_res, m_ts        = marker_result_queue.get_nowait()
+            last_marker_result = m_res
+            last_marker_ts     = m_ts
+        except queue.Empty:
+            pass
+
+        try:
+            qr_res, qr_ts  = qr_result_queue.get_nowait()
+            last_qr_result = qr_res
+            last_qr_ts     = qr_ts
+        except queue.Empty:
+            pass
 
         try:
             b_res, b_ts         = balloon_result_queue.get_nowait()
@@ -483,20 +516,59 @@ def main():
         except queue.Empty:
             pass
 
-        if not marker_found:
+        # ════════════════════════════════════════════════════════════
+        #  PRIORITY: MARKER → QR → BALLOON
+        # ════════════════════════════════════════════════════════════
+        detected      = None
+        detect_source = ""
+
+        # 1. ArUco / AprilTag
+        if (last_marker_result is not None and
+                (now - last_marker_ts) < MARKER_RESULT_TTL):
+            r = last_marker_result
+            tx, ty = r["tx"], r["ty"]
+            detected      = (tx, ty, r["label"])
+            detect_source = r["source"]
+            if r["type"] == "ARUCO":
+                aruco.drawDetectedMarkers(
+                    frame, [r["corner"]], np.array([[r["aruco_id"]]]))
+        else:
+            if (now - last_marker_ts) >= MARKER_RESULT_TTL:
+                last_marker_result = None
+
+        # 2. QR
+        if detected is None:
+            if (last_qr_result is not None and
+                    (now - last_qr_ts) < QR_RESULT_TTL):
+                tx, ty, data, pts = last_qr_result
+                detected      = (tx, ty, f"QR:{data}")
+                detect_source = "QR"
+                for i in range(len(pts)):
+                    cv2.line(frame, tuple(pts[i]),
+                             tuple(pts[(i + 1) % len(pts)]),
+                             (0, 255, 0), 2)
+                cv2.putText(frame, f"{data[:30]}", (tx - 20, ty + 45),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            (255, 255, 0), 2)
+                print(f"[QR] Data:{data}  X:{tx}  Y:{ty}")
+            else:
+                if (now - last_qr_ts) >= QR_RESULT_TTL:
+                    last_qr_result = None
+
+        # 3. Balloon
+        if detected is None:
             if (last_balloon_result is not None and
                     (now - last_balloon_ts) < BALLOON_RESULT_TTL):
                 b_center, b_radius, b_color, b_contour = last_balloon_result
-                bx, by = b_center
-                dx_px  = bx - cx
-                dy_px  = cy - by
-
-                meters_per_pixel = BALLOON_DIAMETER_M / (2 * b_radius + 1e-6)
-                dx_m    = dx_px * meters_per_pixel
-                dy_m    = dy_px * meters_per_pixel
-                dist_m  = np.sqrt(dx_m ** 2 + dy_m ** 2)
-                aligned = (abs(dx_px) <= ALIGNMENT_THRESHOLD and
-                           abs(dy_px) <= ALIGNMENT_THRESHOLD)
+                bx, by   = b_center
+                dx_px    = bx - cx
+                dy_px    = cy - by
+                mpp      = BALLOON_DIAMETER_M / (2 * b_radius + 1e-6)
+                dx_m     = dx_px * mpp
+                dy_m     = dy_px * mpp
+                dist_m   = np.sqrt(dx_m ** 2 + dy_m ** 2)
+                aligned  = (abs(dx_px) <= ALIGNMENT_THRESHOLD and
+                            abs(dy_px) <= ALIGNMENT_THRESHOLD)
 
                 detected      = (bx, by, f"Balloon:{b_color}")
                 detect_source = "BALLOON"
@@ -514,15 +586,18 @@ def main():
 
                 if aligned:
                     cv2.putText(frame, "ALIGNED", (20, 155),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.85,
+                                (0, 255, 0), 2)
                 else:
                     moves = []
                     if abs(dx_px) > ALIGNMENT_THRESHOLD:
                         moves.append(
-                            f"{'RIGHT' if dx_px > 0 else 'LEFT'} {abs(dx_m):.2f}m")
+                            f"{'RIGHT' if dx_px > 0 else 'LEFT'}"
+                            f" {abs(dx_m):.2f}m")
                     if abs(dy_px) > ALIGNMENT_THRESHOLD:
                         moves.append(
-                            f"{'UP' if dy_px > 0 else 'DOWN'} {abs(dy_m):.2f}m")
+                            f"{'UP' if dy_px > 0 else 'DOWN'}"
+                            f" {abs(dy_m):.2f}m")
                     cv2.putText(frame, "MOVE: " + " | ".join(moves),
                                 (20, 155), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.75, (0, 0, 255), 2)
@@ -542,6 +617,7 @@ def main():
                 last_target         = None
                 last_qr_result      = None
                 last_balloon_result = None
+                last_marker_result  = None
 
         # ════════════════════════════════════════════════════════════
         #  DISPLAY
@@ -553,35 +629,37 @@ def main():
             cv2.line(frame, (cx, cy), (tx, ty), (0, 255, 0), 2)
             cv2.putText(frame, label, (tx - 20, ty - 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-            cv2.putText(frame, f"dx:{dx:+d}  dy:{dy:+d}", (tx - 20, ty + 22),
+            cv2.putText(frame, f"dx:{dx:+d}  dy:{dy:+d}",
+                        (tx - 20, ty + 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0), 1)
             cv2.putText(frame, detect_source, (w - 200, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 200), 2)
             status = ("CENTERED"
-                      if abs(dx) < CENTER_TOLERANCE and abs(dy) < CENTER_TOLERANCE
+                      if abs(dx) < CENTER_TOLERANCE
+                      and abs(dy) < CENTER_TOLERANCE
                       else "NOT CENTERED")
             color  = (0, 255, 0) if status == "CENTERED" else (0, 0, 255)
         else:
             status, color = "NO TARGET", (0, 0, 255)
 
         # Crosshair
-        cv2.line(frame, (cx - 25, cy), (cx + 25, cy), (0, 255, 255), 2)
-        cv2.line(frame, (cx, cy - 25), (cx, cy + 25), (0, 255, 255), 2)
-        cv2.circle(frame, (cx, cy), 4, (0, 255, 255), -1)
+        cv2.line(frame, (cx-25, cy), (cx+25, cy), (0,255,255), 2)
+        cv2.line(frame, (cx, cy-25), (cx, cy+25), (0,255,255), 2)
+        cv2.circle(frame, (cx, cy), 4, (0,255,255), -1)
 
         # HUD
-        cv2.putText(frame, f"{mode} (bright:{int(brightness)})", (w - 270, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (0, 200, 255) if mode == "NIGHT" else (0, 255, 100), 2)
+        cv2.putText(frame,
+                    f"{mode} (bright:{int(brightness)})",
+                    (w - 270, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0,200,255) if mode=="NIGHT" else (0,255,100), 2)
         cv2.putText(frame, status, (30, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, 3)
 
-        # ── Show all windows ──
         cv2.imshow("Integrated Detection", frame)
 
         with display_lock:
             if shared_balloon_mask is not None:
-                cv2.imshow("Balloon Mask", shared_balloon_mask)
+                cv2.imshow("Balloon Mask",  shared_balloon_mask)
             if shared_balloon_edges is not None:
                 cv2.imshow("Balloon Edges", shared_balloon_edges)
 
