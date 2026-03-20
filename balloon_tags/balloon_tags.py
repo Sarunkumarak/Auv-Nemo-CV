@@ -9,10 +9,19 @@ import time
 # ─────────────────────────────────────────────
 #  CAMERA
 # ─────────────────────────────────────────────
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
+
+if not cap.isOpened():
+    print("[ERROR] Camera failed to open — check /dev/video0 exists")
+    print("        Run: ls /dev/video*")
+    exit(1)
+else:
+    print(f"[INFO] Camera opened — {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+          f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
 
 # ─────────────────────────────────────────────
 #  QR DETECTOR
@@ -73,10 +82,11 @@ SHARPEN_KERNEL = np.array([[ 0, -1,  0],
 # ─────────────────────────────────────────────
 #  BALLOON CONFIG
 # ─────────────────────────────────────────────
-BALLOON_AREA_THRESHOLD = 3000
-BALLOON_DIAMETER_M     = 0.25
-BALLOON_RESULT_TTL     = 0.15
-BALLOON_SCALE          = 0.5
+BALLOON_AREA_THRESHOLD  = 3000
+BALLOON_DIAMETER_M      = 0.25
+BALLOON_RESULT_TTL      = 0.30
+BALLOON_SCALE           = 0.5
+BALLOON_EARLY_EXIT_AREA = 8000
 
 COLOR_RANGES = {
     "RED": [
@@ -109,7 +119,7 @@ shared_balloon_mask  = None
 shared_balloon_edges = None
 
 # ─────────────────────────────────────────────
-#  MUTABLE GLOBALS (written by main, read by workers)
+#  MUTABLE GLOBALS
 # ─────────────────────────────────────────────
 last_qr_result      = None
 last_qr_ts          = 0.0
@@ -159,7 +169,8 @@ def try_detect_qr(img, cx, cy):
             if data and pts is not None:
                 pts = pts[0].astype(int)
                 if cv2.contourArea(pts.astype(np.float32)) >= MIN_QR_AREA:
-                    result = (int(pts[:, 0].mean()), int(pts[:, 1].mean()), data, pts)
+                    result = (int(pts[:, 0].mean()), int(pts[:, 1].mean()),
+                              data, pts)
         except Exception:
             pass
     return result
@@ -205,18 +216,8 @@ def is_balloon_contour(cnt, min_circularity=0.65):
         return False
     return (4 * np.pi * area / (perim ** 2)) > min_circularity
 
-def white_balance(img):
-    result              = img.astype(np.float32)
-    avg_b, avg_g, avg_r = (np.mean(result[:, :, c]) for c in range(3))
-    avg_gray            = (avg_b + avg_g + avg_r) / 3
-    result[:, :, 0]    *= avg_gray / (avg_b + 1e-6)
-    result[:, :, 1]    *= avg_gray / (avg_g + 1e-6)
-    result[:, :, 2]    *= avg_gray / (avg_r + 1e-6)
-    return np.clip(result, 0, 255).astype(np.uint8)
-
 def balloon_worker():
     global shared_balloon_mask, shared_balloon_edges
-    local_clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
     while True:
         try:
@@ -224,30 +225,30 @@ def balloon_worker():
         except queue.Empty:
             continue
 
-        wb       = white_balance(frame_small)
-        lab      = cv2.cvtColor(wb, cv2.COLOR_BGR2LAB)
-        l, a, b  = cv2.split(lab)
-        l        = local_clahe.apply(l)
-        enhanced = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
-        blurred  = cv2.GaussianBlur(enhanced, (7, 7), 0)
-        hsv      = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-        gray_s   = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
-        edges_s  = cv2.Canny(gray_s, 50, 150)
+        # ── Lightweight preprocessing ──
+        blurred = cv2.GaussianBlur(frame_small, (5, 5), 0)
+        hsv     = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        gray_s  = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+        edges_s = cv2.Canny(gray_s, 50, 150)
 
         best_contour   = None
         detected_color = None
         max_area       = 0
         best_mask_s    = None
+        early_exit     = False
 
         for color_name, ranges in COLOR_RANGES.items():
+            if early_exit:
+                break
+
             mask = None
             for lower, upper in ranges:
                 temp = cv2.inRange(hsv, lower, upper)
                 mask = temp if mask is None else cv2.bitwise_or(mask, temp)
 
             mask = cv2.medianBlur(mask, 5)
-            mask = cv2.erode(mask,  None, iterations=2)
-            mask = cv2.dilate(mask, None, iterations=2)
+            mask = cv2.erode(mask,  None, iterations=1)
+            mask = cv2.dilate(mask, None, iterations=1)
 
             contours, _ = cv2.findContours(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -269,10 +270,14 @@ def balloon_worker():
                     best_contour   = cnt
                     detected_color = color_name
                     best_mask_s    = mask.copy()
+                    if area > BALLOON_EARLY_EXIT_AREA * (scale ** 2):
+                        early_exit = True
+                        break
 
         mask_full = cv2.resize(
             best_mask_s if best_mask_s is not None
-            else np.zeros((frame_small.shape[0], frame_small.shape[1]), dtype=np.uint8),
+            else np.zeros((frame_small.shape[0], frame_small.shape[1]),
+                          dtype=np.uint8),
             (full_w, full_h), interpolation=cv2.INTER_NEAREST)
 
         edges_full = cv2.resize(edges_s, (full_w, full_h),
@@ -330,7 +335,6 @@ def main():
     global last_balloon_result, last_balloon_ts
     global last_target, lost_frames
 
-    # Start background threads
     threading.Thread(target=qr_worker,      daemon=True).start()
     threading.Thread(target=balloon_worker, daemon=True).start()
 
@@ -339,6 +343,7 @@ def main():
     while True:
         ret, frame = cap.read()
         if not ret:
+            print("[ERROR] Failed to grab frame — camera disconnected?")
             break
 
         h, w   = frame.shape[:2]
@@ -465,7 +470,8 @@ def main():
         # ════════════════════════════════════════════════════════════
         if balloon_input_queue.empty():
             try:
-                small = cv2.resize(frame, (0, 0), fx=BALLOON_SCALE, fy=BALLOON_SCALE)
+                small = cv2.resize(frame, (0, 0),
+                                   fx=BALLOON_SCALE, fy=BALLOON_SCALE)
                 balloon_input_queue.put_nowait((small, BALLOON_SCALE, w, h))
             except queue.Full:
                 pass
@@ -478,7 +484,8 @@ def main():
             pass
 
         if not marker_found:
-            if last_balloon_result is not None and (now - last_balloon_ts) < BALLOON_RESULT_TTL:
+            if (last_balloon_result is not None and
+                    (now - last_balloon_ts) < BALLOON_RESULT_TTL):
                 b_center, b_radius, b_color, b_contour = last_balloon_result
                 bx, by = b_center
                 dx_px  = bx - cx
@@ -511,9 +518,11 @@ def main():
                 else:
                     moves = []
                     if abs(dx_px) > ALIGNMENT_THRESHOLD:
-                        moves.append(f"{'RIGHT' if dx_px > 0 else 'LEFT'} {abs(dx_m):.2f}m")
+                        moves.append(
+                            f"{'RIGHT' if dx_px > 0 else 'LEFT'} {abs(dx_m):.2f}m")
                     if abs(dy_px) > ALIGNMENT_THRESHOLD:
-                        moves.append(f"{'UP' if dy_px > 0 else 'DOWN'} {abs(dy_m):.2f}m")
+                        moves.append(
+                            f"{'UP' if dy_px > 0 else 'DOWN'} {abs(dy_m):.2f}m")
                     cv2.putText(frame, "MOVE: " + " | ".join(moves),
                                 (20, 155), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.75, (0, 0, 255), 2)
@@ -548,7 +557,9 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0), 1)
             cv2.putText(frame, detect_source, (w - 200, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 200), 2)
-            status = "CENTERED" if abs(dx) < CENTER_TOLERANCE and abs(dy) < CENTER_TOLERANCE else "NOT CENTERED"
+            status = ("CENTERED"
+                      if abs(dx) < CENTER_TOLERANCE and abs(dy) < CENTER_TOLERANCE
+                      else "NOT CENTERED")
             color  = (0, 255, 0) if status == "CENTERED" else (0, 0, 255)
         else:
             status, color = "NO TARGET", (0, 0, 255)
