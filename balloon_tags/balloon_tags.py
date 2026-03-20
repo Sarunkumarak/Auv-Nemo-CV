@@ -89,21 +89,20 @@ HSV_RANGES = [
     (np.array([35,   80,  60]), np.array([85,  255, 255]), "GREEN"),
     (np.array([95,  100,  60]), np.array([140, 255, 255]), "BLUE"),
 ]
-HSV_NAMES  = [r[2] for r in HSV_RANGES]
-
+HSV_NAMES    = [r[2] for r in HSV_RANGES]
+_morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 BALLOON_MIN_AREA = 300
 BALLOON_CIRC_MIN = 0.60
-_morph_kernel    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 # ─────────────────────────────────────────────
 #  GATE CONFIG
 # ─────────────────────────────────────────────
-GATE_RESULT_TTL    = 0.20
-GATE_SCALE         = 0.25
-KNOWN_DISTANCE     = 150.0    # cm
-REAL_GATE_WIDTH    = 100.0    # cm
-GATE_FOCAL_LENGTH  = None     # calculated on first detection
-GATE_DIST_BUFFER   = []
+GATE_RESULT_TTL      = 0.20
+GATE_SCALE           = 0.25
+KNOWN_DISTANCE       = 150.0
+REAL_GATE_WIDTH      = 100.0
+GATE_FOCAL_LENGTH    = None
+GATE_DIST_BUFFER     = []
 
 GATE_COLOR_RANGES = {
     "red":   [(np.array([0,  80, 40]), np.array([10,  255, 255])),
@@ -254,7 +253,6 @@ def april_worker():
                 "label":  f"April {tag.tag_id}",
                 "source": "APRIL",
             }
-            print(f"[AprilTag] ID:{tag.tag_id}  X:{tx}  Y:{ty}")
             break
         force_put(april_result_queue, (result, time.monotonic()))
 
@@ -430,29 +428,25 @@ def gate_worker():
         except queue.Empty:
             continue
 
-        # ── Preprocessing (same as original gate code) ──
-        lab    = cv2.cvtColor(frame_s, cv2.COLOR_BGR2LAB)
+        lab     = cv2.cvtColor(frame_s, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        l      = cv2.createCLAHE(clipLimit=3.0,
-                                  tileGridSize=(8, 8)).apply(l)
+        l       = cv2.createCLAHE(clipLimit=3.0,
+                                   tileGridSize=(8, 8)).apply(l)
         frame_enh = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
 
-        hsv    = cv2.cvtColor(frame_enh, cv2.COLOR_BGR2HSV)
-        h_ch, s_ch, v_ch = cv2.split(hsv)
-        v_ch   = cv2.createCLAHE(clipLimit=2.0,
-                                   tileGridSize=(8, 8)).apply(v_ch)
-        hsv    = cv2.merge((h_ch, s_ch, v_ch))
-
-        gray_s = cv2.cvtColor(frame_enh, cv2.COLOR_BGR2GRAY)
-        gray_s = cv2.GaussianBlur(gray_s, (5, 5), 0)
-        kernel = np.ones((3, 3), np.uint8)
+        hsv_g       = cv2.cvtColor(frame_enh, cv2.COLOR_BGR2HSV)
+        h_ch, s_ch, v_ch = cv2.split(hsv_g)
+        v_ch        = cv2.createCLAHE(clipLimit=2.0,
+                                       tileGridSize=(8, 8)).apply(v_ch)
+        hsv_g       = cv2.merge((h_ch, s_ch, v_ch))
+        kernel      = np.ones((3, 3), np.uint8)
 
         detections = {}
 
         for color_name, ranges in GATE_COLOR_RANGES.items():
             mask = None
             for lower, upper in ranges:
-                temp = cv2.inRange(hsv, lower, upper)
+                temp = cv2.inRange(hsv_g, lower, upper)
                 mask = temp if mask is None else cv2.bitwise_or(mask, temp)
 
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   kernel)
@@ -469,29 +463,26 @@ def gate_worker():
             if not valid:
                 continue
 
-            gate = max(valid, key=cv2.contourArea)
-            peri  = cv2.arcLength(gate, True)
+            gate   = max(valid, key=cv2.contourArea)
+            peri   = cv2.arcLength(gate, True)
             approx = cv2.approxPolyDP(gate, 0.04 * peri, True)
 
             if not (4 <= len(approx) <= 8):
                 continue
 
             x, y, bw, bh = cv2.boundingRect(gate)
-            # Scale back to full res
             x  = int(x  / scale)
             y  = int(y  / scale)
             bw = int(bw / scale)
             bh = int(bh / scale)
-            cx_gate = x + bw // 2
-            cy_gate = y + bh // 2
 
             detections[color_name] = {
-                "cx": cx_gate, "cy": cy_gate,
+                "cx": x + bw // 2,
+                "cy": y + bh // 2,
                 "bw": bw, "bh": bh,
-                "x": x, "y": y,
+                "x": x,   "y": y,
             }
 
-        # Priority: green > red
         assigned = None
         for color in GATE_PREFERRED_ORDER:
             if color in detections:
@@ -500,10 +491,8 @@ def gate_worker():
 
         result = None
         if assigned:
-            tgt = detections[assigned]
-            bw  = tgt["bw"]
-            bh  = tgt["bh"]
-            avg_size = (bw + bh) / 2
+            tgt      = detections[assigned]
+            avg_size = (tgt["bw"] + tgt["bh"]) / 2
 
             if GATE_FOCAL_LENGTH is None and avg_size > 0:
                 GATE_FOCAL_LENGTH = (avg_size * KNOWN_DISTANCE) / REAL_GATE_WIDTH
@@ -517,17 +506,18 @@ def gate_worker():
                 dist_cm = sum(GATE_DIST_BUFFER) / len(GATE_DIST_BUFFER)
 
             result = {
-                "color":    assigned,
-                "cx":       tgt["cx"],
-                "cy":       tgt["cy"],
-                "bw":       bw,
-                "bh":       bh,
-                "x":        tgt["x"],
-                "y":        tgt["y"],
-                "dist_cm":  dist_cm,
-                "all":      detections,
+                "color":   assigned,
+                "cx":      tgt["cx"],
+                "cy":      tgt["cy"],
+                "bw":      tgt["bw"],
+                "bh":      tgt["bh"],
+                "x":       tgt["x"],
+                "y":       tgt["y"],
+                "dist_cm": dist_cm,
+                "all":     detections,
             }
-            print(f"[Gate] {assigned.upper()}  "
+            # ── ONLY print when gate is detected ──
+            print(f"[Gate] {assigned.upper()} DETECTED  "
                   f"X:{tgt['cx']}  Y:{tgt['cy']}  "
                   f"Dist:{int(dist_cm) if dist_cm else '?'}cm")
 
@@ -629,9 +619,6 @@ def main():
             if best_r:
                 last_marker_result = best_r
                 last_marker_ts     = now
-                print(f"[ArUco-{best_r['source'].split('-')[1]}] "
-                      f"ID:{best_r['aruco_id']}  "
-                      f"X:{best_r['tx']}  Y:{best_r['ty']}")
 
         # ── Collect AprilTag ──
         try:
@@ -703,7 +690,6 @@ def main():
                 cv2.putText(frame, f"{data[:30]}", (tx - 20, ty + 45),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                             (255, 255, 0), 2)
-                print(f"[QR] Data:{data}  X:{tx}  Y:{ty}")
             else:
                 if (now - last_qr_ts) >= QR_RESULT_TTL:
                     last_qr_result = None
@@ -725,7 +711,6 @@ def main():
 
                 detected      = (bx, by, f"Balloon:{b_color}")
                 detect_source = "BALLOON"
-                print(f"[Balloon] {b_color}  X:{bx}  Y:{by}")
 
                 cv2.drawContours(frame, [b_contour], -1, (0, 255, 0), 2)
                 cv2.circle(frame, b_center, int(b_radius), (255, 0, 0), 2)
@@ -767,7 +752,6 @@ def main():
                 detected      = (gcx, gcy, f"Gate:{g['color'].upper()}")
                 detect_source = f"GATE-{g['color'].upper()}"
 
-                # Draw gate box
                 col = (0, 255, 0) if g["color"] == "green" else (0, 0, 255)
                 cv2.rectangle(frame,
                               (g["x"], g["y"]),
@@ -775,14 +759,11 @@ def main():
                               col, 2)
                 cv2.circle(frame, (gcx, gcy), 5, (0, 0, 255), -1)
                 cv2.line(frame, (cx, cy), (gcx, gcy), col, 2)
-
-                # Gate label
                 cv2.putText(frame,
                             f"GATE: {g['color'].upper()}",
                             (g["x"], g["y"] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2)
 
-                # Distance
                 if g["dist_cm"]:
                     cv2.putText(frame,
                                 f"Dist: {int(g['dist_cm'])} cm",
@@ -790,11 +771,10 @@ def main():
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.75,
                                 (0, 255, 255), 2)
 
-                # Navigation offsets
-                dx_px  = gcx - cx
-                dy_px  = gcy - cy
-                ox     = dx_px / (w / 2)
-                oy     = -dy_px / (h / 2)
+                dx_px = gcx - cx
+                dy_px = gcy - cy
+                ox    = dx_px / (w / 2)
+                oy    = -dy_px / (h / 2)
                 cv2.putText(frame, f"Offset X: {ox:.2f}", (20, 125),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                             (255, 255, 0), 2)
@@ -802,7 +782,6 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                             (255, 255, 0), 2)
 
-                # Gate command
                 gate_cmd = "CENTERED"
                 if abs(dx_px) > abs(dy_px):
                     if dx_px > 40:
@@ -818,8 +797,7 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.75,
                             (255, 255, 255), 2)
 
-                # Both gates visible
-                if ("green" in g["all"] and "red" in g["all"]):
+                if "green" in g["all"] and "red" in g["all"]:
                     cv2.putText(frame,
                                 "Prioritizing GREEN over RED",
                                 (20, 215),
