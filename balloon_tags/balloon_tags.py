@@ -77,36 +77,43 @@ SHARPEN_KERNEL = np.array([[ 0, -1,  0],
 # ─────────────────────────────────────────────
 #  BALLOON CONFIG
 # ─────────────────────────────────────────────
-BALLOON_AREA_THRESHOLD  = 3000
-BALLOON_DIAMETER_M      = 0.25
-BALLOON_RESULT_TTL      = 0.30
-BALLOON_SCALE           = 0.5
-BALLOON_EARLY_EXIT_AREA = 8000
+BALLOON_DIAMETER_M  = 0.25
+BALLOON_RESULT_TTL  = 0.20
+BALLOON_SCALE       = 0.25    # ← 0.25x = 320x180, very fast
 
-COLOR_RANGES = {
-    "RED": [
-        (np.array([0,   100,  70]), np.array([8,   255, 255])),
-        (np.array([170, 100,  70]), np.array([180, 255, 255]))
-    ],
-    "ORANGE": [(np.array([8,  100, 80]), np.array([20,  255, 255]))],
-    "YELLOW": [(np.array([23, 100, 80]), np.array([35,  255, 255]))],
-    "GREEN":  [(np.array([35,  80, 60]), np.array([85,  255, 255]))],
-    "BLUE":   [(np.array([95, 100, 60]), np.array([140, 255, 255]))]
-}
+# Pre-built merged HSV range table — (lower, upper, name)
+# All ranges in one flat list, checked in single pass
+HSV_RANGES = [
+    (np.array([0,   100,  70]), np.array([8,   255, 255]), "RED"),
+    (np.array([170, 100,  70]), np.array([180, 255, 255]), "RED"),
+    (np.array([8,   100,  80]), np.array([20,  255, 255]), "ORANGE"),
+    (np.array([23,  100,  80]), np.array([35,  255, 255]), "YELLOW"),
+    (np.array([35,   80,  60]), np.array([85,  255, 255]), "GREEN"),
+    (np.array([95,  100,  60]), np.array([140, 255, 255]), "BLUE"),
+]
+
+# Precompute numpy arrays once at startup — no allocation in hot loop
+HSV_LOWERS = np.array([r[0] for r in HSV_RANGES], dtype=np.uint8)
+HSV_UPPERS = np.array([r[1] for r in HSV_RANGES], dtype=np.uint8)
+HSV_NAMES  = [r[2] for r in HSV_RANGES]
+
+# Minimum balloon area at 0.25 scale
+BALLOON_MIN_AREA  = 300    # 3000 * (0.25^2) = 187, use 300 for safety
+BALLOON_CIRC_MIN  = 0.60   # slightly relaxed for tiny blobs
 
 # ─────────────────────────────────────────────
 #  TUNABLE CONSTANTS
 # ─────────────────────────────────────────────
 CENTER_TOLERANCE    = 60
-MAX_LOST            = 8        # reduced — drop stale lock faster
+MAX_LOST            = 8
 NIGHT_THRESHOLD     = 80
-MIN_MARKER_AREA     = 500      # reduced for half-res
+MIN_MARKER_AREA     = 500
 MIN_QR_AREA         = 1500
-QR_RESULT_TTL       = 0.25     # tighter
-MARKER_RESULT_TTL   = 0.10     # tighter — stale results drop fast
+QR_RESULT_TTL       = 0.25
+MARKER_RESULT_TTL   = 0.10
 SPATIAL_MERGE_DIST  = 80
 ALIGNMENT_THRESHOLD = 30
-DETECT_SCALE        = 0.5      # ArUco + April run on half-res too
+DETECT_SCALE        = 0.5
 
 # ─────────────────────────────────────────────
 #  SHARED DISPLAY FRAMES
@@ -128,10 +135,9 @@ last_target         = None
 lost_frames         = 0
 
 # ─────────────────────────────────────────────
-#  KEY HELPER — flush + put (always latest frame)
+#  force_put — always give thread the latest frame
 # ─────────────────────────────────────────────
 def force_put(q, item):
-    """Drain queue then put — thread always gets the LATEST frame."""
     while True:
         try:
             q.get_nowait()
@@ -163,15 +169,8 @@ def is_valid_marker(pts, scale=1.0):
         return False
     return True
 
-def is_balloon_contour(cnt, min_circularity=0.65):
-    area  = cv2.contourArea(cnt)
-    perim = cv2.arcLength(cnt, True)
-    if perim == 0:
-        return False
-    return (4 * np.pi * area / (perim ** 2)) > min_circularity
-
 # ─────────────────────────────────────────────
-#  ARUCO THREADS — one per dict, half-res input
+#  ARUCO THREADS
 # ─────────────────────────────────────────────
 aruco_input_queues = [queue.Queue(maxsize=2) for _ in ARUCO_DICTS]
 aruco_result_queue = queue.Queue(maxsize=8)
@@ -188,22 +187,19 @@ def make_aruco_worker(det_idx):
                 gray_s, enhanced_s, scale = in_q.get(timeout=1.0)
             except queue.Empty:
                 continue
-
             corners, ids, _ = detector.detectMarkers(enhanced_s)
             if ids is None:
                 corners, ids, _ = detector.detectMarkers(gray_s)
             if ids is None or len(ids) == 0:
                 continue
-
             ts = time.monotonic()
             for i in range(len(ids)):
                 c = corners[i][0]
                 if not is_valid_marker(c, scale):
                     continue
-                area = cv2.contourArea(c)
-                # Scale coords back to full res
-                tx   = int(c[:, 0].mean() / scale)
-                ty   = int(c[:, 1].mean() / scale)
+                area        = cv2.contourArea(c)
+                tx          = int(c[:, 0].mean() / scale)
+                ty          = int(c[:, 1].mean() / scale)
                 corner_full = (corners[i] / scale).astype(np.float32)
                 result = {
                     "type":     "ARUCO",
@@ -223,7 +219,7 @@ def make_aruco_worker(det_idx):
     return worker
 
 # ─────────────────────────────────────────────
-#  APRILTAG THREAD — half-res input
+#  APRILTAG THREAD
 # ─────────────────────────────────────────────
 april_input_queue  = queue.Queue(maxsize=2)
 april_result_queue = queue.Queue(maxsize=2)
@@ -234,7 +230,6 @@ def april_worker():
             enhanced_s, scale = april_input_queue.get(timeout=1.0)
         except queue.Empty:
             continue
-
         tags   = apriltag_detector.detect(enhanced_s)
         result = None
         for tag in tags:
@@ -248,8 +243,6 @@ def april_worker():
             }
             print(f"[AprilTag] ID:{tag.tag_id}  X:{tx}  Y:{ty}")
             break
-
-        # Always push (flush old first)
         force_put(april_result_queue, (result, time.monotonic()))
 
 # ─────────────────────────────────────────────
@@ -321,79 +314,96 @@ def qr_worker():
         force_put(qr_result_queue, (result, time.monotonic()))
 
 # ─────────────────────────────────────────────
-#  BALLOON THREAD
+#  BALLOON THREAD — ultra-fast 0.25x scale
 # ─────────────────────────────────────────────
 balloon_input_queue  = queue.Queue(maxsize=2)
 balloon_result_queue = queue.Queue(maxsize=2)
+
+# Morph kernel — reused, no allocation per frame
+_morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 def balloon_worker():
     global shared_balloon_mask, shared_balloon_edges
 
     while True:
         try:
-            frame_small, scale, full_w, full_h = \
+            frame_s, scale, full_w, full_h = \
                 balloon_input_queue.get(timeout=1.0)
         except queue.Empty:
             continue
 
-        blurred = cv2.GaussianBlur(frame_small, (5, 5), 0)
+        # ── Single blur + HSV convert ──
+        blurred = cv2.GaussianBlur(frame_s, (3, 3), 0)   # 3x3 on tiny image
         hsv     = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
         gray_s  = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
-        edges_s = cv2.Canny(gray_s, 50, 150)
+        edges_s = cv2.Canny(gray_s, 40, 120)
+
+        # ── Single-pass mask — all colors at once ──
+        # Build combined mask and per-color label map simultaneously
+        combined_mask  = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        color_label    = np.full(hsv.shape[:2], -1, dtype=np.int8)
+
+        for idx, (lower, upper, _) in enumerate(HSV_RANGES):
+            m = cv2.inRange(hsv, lower, upper)
+            # Label pixels with color index (later one wins ties — fine)
+            color_label[m > 0] = idx
+            combined_mask = cv2.bitwise_or(combined_mask, m)
+
+        # ── One morphology pass on combined mask ──
+        combined_mask = cv2.morphologyEx(
+            combined_mask, cv2.MORPH_OPEN,  _morph_kernel)
+        combined_mask = cv2.morphologyEx(
+            combined_mask, cv2.MORPH_CLOSE, _morph_kernel)
+
+        # ── Find contours on combined mask ──
+        contours, _ = cv2.findContours(
+            combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         best_contour   = None
-        detected_color = None
+        best_color     = None
         max_area       = 0
-        best_mask_s    = None
-        early_exit     = False
 
-        for color_name, ranges in COLOR_RANGES.items():
-            if early_exit:
-                break
-            mask = None
-            for lower, upper in ranges:
-                temp = cv2.inRange(hsv, lower, upper)
-                mask = temp if mask is None else cv2.bitwise_or(mask, temp)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < BALLOON_MIN_AREA:
+                continue
 
-            mask = cv2.medianBlur(mask, 5)
-            mask = cv2.erode(mask,  None, iterations=1)
-            mask = cv2.dilate(mask, None, iterations=1)
+            # Circularity check
+            perim = cv2.arcLength(cnt, True)
+            if perim == 0:
+                continue
+            if (4 * np.pi * area / (perim ** 2)) < BALLOON_CIRC_MIN:
+                continue
 
-            contours, _ = cv2.findContours(
-                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Edge validation — fast on small image
+            cmask = np.zeros_like(gray_s)
+            cv2.drawContours(cmask, [cnt], -1, 255, -1)
+            if cv2.countNonZero(
+                    cv2.bitwise_and(edges_s, edges_s, mask=cmask)) < 15:
+                continue
 
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area < BALLOON_AREA_THRESHOLD * (scale ** 2):
-                    continue
-                if not is_balloon_contour(cnt):
-                    continue
-                contour_mask = np.zeros_like(gray_s)
-                cv2.drawContours(contour_mask, [cnt], -1, 255, -1)
-                edge_px = cv2.countNonZero(
-                    cv2.bitwise_and(edges_s, edges_s, mask=contour_mask))
-                if edge_px < 30:
-                    continue
-                if area > max_area:
-                    max_area       = area
-                    best_contour   = cnt
-                    detected_color = color_name
-                    best_mask_s    = mask.copy()
-                    if area > BALLOON_EARLY_EXIT_AREA * (scale ** 2):
-                        early_exit = True
-                        break
+            if area > max_area:
+                max_area     = area
+                best_contour = cnt
+                # Determine dominant color from label map inside contour
+                pixels = color_label[cmask > 0]
+                pixels = pixels[pixels >= 0]
+                if len(pixels) > 0:
+                    counts     = np.bincount(pixels.astype(np.uint8),
+                                             minlength=len(HSV_RANGES))
+                    best_color = HSV_NAMES[int(np.argmax(counts))]
+                else:
+                    best_color = "UNKNOWN"
 
-        mask_full = cv2.resize(
-            best_mask_s if best_mask_s is not None
-            else np.zeros(
-                (frame_small.shape[0], frame_small.shape[1]), dtype=np.uint8),
-            (full_w, full_h), interpolation=cv2.INTER_NEAREST)
-        edges_full = cv2.resize(
-            edges_s, (full_w, full_h), interpolation=cv2.INTER_NEAREST)
+        # ── Upscale mask + edges for display ──
+        mask_disp  = cv2.resize(combined_mask, (full_w, full_h),
+                                interpolation=cv2.INTER_NEAREST)
+        edges_disp = cv2.resize(edges_s,       (full_w, full_h),
+                                interpolation=cv2.INTER_NEAREST)
 
         with display_lock:
-            shared_balloon_mask  = mask_full
-            shared_balloon_edges = edges_full
+            shared_balloon_mask  = mask_disp
+            shared_balloon_edges = edges_disp
 
         result = None
         if best_contour is not None:
@@ -401,11 +411,32 @@ def balloon_worker():
             result = (
                 (int(x / scale), int(y / scale)),
                 radius / scale,
-                detected_color,
+                best_color,
                 (best_contour.astype(np.float32) / scale).astype(np.int32)
             )
 
         force_put(balloon_result_queue, (result, time.monotonic()))
+
+# ─────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────
+def is_valid_marker(pts, scale=1.0):
+    area = cv2.contourArea(pts.astype(np.float32))
+    if area < MIN_MARKER_AREA * (scale ** 2):
+        return False
+    sides = [np.linalg.norm(pts[(i+1) % 4] - pts[i]) for i in range(4)]
+    mean  = np.mean(sides)
+    if mean == 0:
+        return False
+    if np.any(np.abs(sides - mean) / mean > 0.40):
+        return False
+    rect = cv2.minAreaRect(pts.astype(np.float32))
+    rw, rh = rect[1]
+    if min(rw, rh) == 0:
+        return False
+    if max(rw, rh) / min(rw, rh) > 1.6:
+        return False
+    return True
 
 # ─────────────────────────────────────────────
 #  MAIN
@@ -416,7 +447,6 @@ def main():
     global last_marker_result,  last_marker_ts
     global last_target, lost_frames
 
-    # Start all threads
     for i in range(len(ARUCO_DICTS)):
         threading.Thread(target=make_aruco_worker(i), daemon=True).start()
     threading.Thread(target=april_worker,   daemon=True).start()
@@ -445,29 +475,25 @@ def main():
             enhanced = cv2.equalizeHist(gray)
             mode     = "DAY"
 
-        # ── Half-res for marker detection ──
+        # Half-res for ArUco + April
         gray_s     = cv2.resize(gray,     (0, 0),
                                 fx=DETECT_SCALE, fy=DETECT_SCALE)
         enhanced_s = cv2.resize(enhanced, (0, 0),
                                 fx=DETECT_SCALE, fy=DETECT_SCALE)
 
-        # ════════════════════════════════════════════════════════════
-        #  FEED ALL THREADS — force_put = always latest frame, no stale
-        # ════════════════════════════════════════════════════════════
+        # Quarter-res for balloon
+        frame_q = cv2.resize(frame, (0, 0),
+                             fx=BALLOON_SCALE, fy=BALLOON_SCALE)
+
+        # ── Feed all threads — always latest frame ──
         for q in aruco_input_queues:
             force_put(q, (gray_s, enhanced_s, DETECT_SCALE))
 
         force_put(april_input_queue,   (enhanced_s, DETECT_SCALE))
         force_put(qr_input_queue,      (gray.copy(), cx, cy))
-        force_put(balloon_input_queue, (
-            cv2.resize(frame, (0, 0), fx=BALLOON_SCALE, fy=BALLOON_SCALE),
-            BALLOON_SCALE, w, h))
+        force_put(balloon_input_queue, (frame_q, BALLOON_SCALE, w, h))
 
-        # ════════════════════════════════════════════════════════════
-        #  COLLECT RESULTS
-        # ════════════════════════════════════════════════════════════
-
-        # Drain ALL fresh ArUco results, pick best
+        # ── Collect results ──
         fresh_aruco = []
         while True:
             try:
@@ -512,7 +538,6 @@ def main():
                       f"ID:{best_r['aruco_id']}  "
                       f"X:{best_r['tx']}  Y:{best_r['ty']}")
 
-        # AprilTag
         try:
             ap_res, ap_ts = april_result_queue.get_nowait()
             if ap_res is not None:
@@ -524,7 +549,6 @@ def main():
         except queue.Empty:
             pass
 
-        # QR
         try:
             qr_res, qr_ts  = qr_result_queue.get_nowait()
             last_qr_result = qr_res
@@ -532,7 +556,6 @@ def main():
         except queue.Empty:
             pass
 
-        # Balloon
         try:
             b_res, b_ts         = balloon_result_queue.get_nowait()
             last_balloon_result = b_res
