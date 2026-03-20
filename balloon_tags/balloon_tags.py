@@ -79,10 +79,8 @@ SHARPEN_KERNEL = np.array([[ 0, -1,  0],
 # ─────────────────────────────────────────────
 BALLOON_DIAMETER_M  = 0.25
 BALLOON_RESULT_TTL  = 0.20
-BALLOON_SCALE       = 0.25    # ← 0.25x = 320x180, very fast
+BALLOON_SCALE       = 0.25
 
-# Pre-built merged HSV range table — (lower, upper, name)
-# All ranges in one flat list, checked in single pass
 HSV_RANGES = [
     (np.array([0,   100,  70]), np.array([8,   255, 255]), "RED"),
     (np.array([170, 100,  70]), np.array([180, 255, 255]), "RED"),
@@ -91,15 +89,28 @@ HSV_RANGES = [
     (np.array([35,   80,  60]), np.array([85,  255, 255]), "GREEN"),
     (np.array([95,  100,  60]), np.array([140, 255, 255]), "BLUE"),
 ]
-
-# Precompute numpy arrays once at startup — no allocation in hot loop
-HSV_LOWERS = np.array([r[0] for r in HSV_RANGES], dtype=np.uint8)
-HSV_UPPERS = np.array([r[1] for r in HSV_RANGES], dtype=np.uint8)
 HSV_NAMES  = [r[2] for r in HSV_RANGES]
 
-# Minimum balloon area at 0.25 scale
-BALLOON_MIN_AREA  = 300    # 3000 * (0.25^2) = 187, use 300 for safety
-BALLOON_CIRC_MIN  = 0.60   # slightly relaxed for tiny blobs
+BALLOON_MIN_AREA = 300
+BALLOON_CIRC_MIN = 0.60
+_morph_kernel    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+# ─────────────────────────────────────────────
+#  GATE CONFIG
+# ─────────────────────────────────────────────
+GATE_RESULT_TTL    = 0.20
+GATE_SCALE         = 0.25
+KNOWN_DISTANCE     = 150.0    # cm
+REAL_GATE_WIDTH    = 100.0    # cm
+GATE_FOCAL_LENGTH  = None     # calculated on first detection
+GATE_DIST_BUFFER   = []
+
+GATE_COLOR_RANGES = {
+    "red":   [(np.array([0,  80, 40]), np.array([10,  255, 255])),
+              (np.array([165, 80, 40]), np.array([180, 255, 255]))],
+    "green": [(np.array([35, 60, 40]), np.array([85,  255, 255]))],
+}
+GATE_PREFERRED_ORDER = ["green", "red"]
 
 # ─────────────────────────────────────────────
 #  TUNABLE CONSTANTS
@@ -131,11 +142,13 @@ last_balloon_result = None
 last_balloon_ts     = 0.0
 last_marker_result  = None
 last_marker_ts      = 0.0
+last_gate_result    = None
+last_gate_ts        = 0.0
 last_target         = None
 lost_frames         = 0
 
 # ─────────────────────────────────────────────
-#  force_put — always give thread the latest frame
+#  force_put
 # ─────────────────────────────────────────────
 def force_put(q, item):
     while True:
@@ -314,13 +327,10 @@ def qr_worker():
         force_put(qr_result_queue, (result, time.monotonic()))
 
 # ─────────────────────────────────────────────
-#  BALLOON THREAD — ultra-fast 0.25x scale
+#  BALLOON THREAD
 # ─────────────────────────────────────────────
 balloon_input_queue  = queue.Queue(maxsize=2)
 balloon_result_queue = queue.Queue(maxsize=2)
-
-# Morph kernel — reused, no allocation per frame
-_morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 def balloon_worker():
     global shared_balloon_mask, shared_balloon_edges
@@ -332,60 +342,48 @@ def balloon_worker():
         except queue.Empty:
             continue
 
-        # ── Single blur + HSV convert ──
-        blurred = cv2.GaussianBlur(frame_s, (3, 3), 0)   # 3x3 on tiny image
+        blurred = cv2.GaussianBlur(frame_s, (3, 3), 0)
         hsv     = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
         gray_s  = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
         edges_s = cv2.Canny(gray_s, 40, 120)
 
-        # ── Single-pass mask — all colors at once ──
-        # Build combined mask and per-color label map simultaneously
-        combined_mask  = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        color_label    = np.full(hsv.shape[:2], -1, dtype=np.int8)
+        combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        color_label   = np.full(hsv.shape[:2], -1, dtype=np.int8)
 
         for idx, (lower, upper, _) in enumerate(HSV_RANGES):
             m = cv2.inRange(hsv, lower, upper)
-            # Label pixels with color index (later one wins ties — fine)
             color_label[m > 0] = idx
             combined_mask = cv2.bitwise_or(combined_mask, m)
 
-        # ── One morphology pass on combined mask ──
         combined_mask = cv2.morphologyEx(
             combined_mask, cv2.MORPH_OPEN,  _morph_kernel)
         combined_mask = cv2.morphologyEx(
             combined_mask, cv2.MORPH_CLOSE, _morph_kernel)
 
-        # ── Find contours on combined mask ──
         contours, _ = cv2.findContours(
             combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        best_contour   = None
-        best_color     = None
-        max_area       = 0
+        best_contour = None
+        best_color   = None
+        max_area     = 0
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < BALLOON_MIN_AREA:
                 continue
-
-            # Circularity check
             perim = cv2.arcLength(cnt, True)
             if perim == 0:
                 continue
             if (4 * np.pi * area / (perim ** 2)) < BALLOON_CIRC_MIN:
                 continue
-
-            # Edge validation — fast on small image
             cmask = np.zeros_like(gray_s)
             cv2.drawContours(cmask, [cnt], -1, 255, -1)
             if cv2.countNonZero(
                     cv2.bitwise_and(edges_s, edges_s, mask=cmask)) < 15:
                 continue
-
             if area > max_area:
                 max_area     = area
                 best_contour = cnt
-                # Determine dominant color from label map inside contour
                 pixels = color_label[cmask > 0]
                 pixels = pixels[pixels >= 0]
                 if len(pixels) > 0:
@@ -395,10 +393,9 @@ def balloon_worker():
                 else:
                     best_color = "UNKNOWN"
 
-        # ── Upscale mask + edges for display ──
         mask_disp  = cv2.resize(combined_mask, (full_w, full_h),
                                 interpolation=cv2.INTER_NEAREST)
-        edges_disp = cv2.resize(edges_s,       (full_w, full_h),
+        edges_disp = cv2.resize(edges_s, (full_w, full_h),
                                 interpolation=cv2.INTER_NEAREST)
 
         with display_lock:
@@ -418,25 +415,123 @@ def balloon_worker():
         force_put(balloon_result_queue, (result, time.monotonic()))
 
 # ─────────────────────────────────────────────
-#  HELPERS
+#  GATE THREAD
 # ─────────────────────────────────────────────
-def is_valid_marker(pts, scale=1.0):
-    area = cv2.contourArea(pts.astype(np.float32))
-    if area < MIN_MARKER_AREA * (scale ** 2):
-        return False
-    sides = [np.linalg.norm(pts[(i+1) % 4] - pts[i]) for i in range(4)]
-    mean  = np.mean(sides)
-    if mean == 0:
-        return False
-    if np.any(np.abs(sides - mean) / mean > 0.40):
-        return False
-    rect = cv2.minAreaRect(pts.astype(np.float32))
-    rw, rh = rect[1]
-    if min(rw, rh) == 0:
-        return False
-    if max(rw, rh) / min(rw, rh) > 1.6:
-        return False
-    return True
+gate_input_queue  = queue.Queue(maxsize=2)
+gate_result_queue = queue.Queue(maxsize=2)
+
+def gate_worker():
+    global GATE_FOCAL_LENGTH, GATE_DIST_BUFFER
+
+    while True:
+        try:
+            frame_s, scale, full_w, full_h = \
+                gate_input_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        # ── Preprocessing (same as original gate code) ──
+        lab    = cv2.cvtColor(frame_s, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l      = cv2.createCLAHE(clipLimit=3.0,
+                                  tileGridSize=(8, 8)).apply(l)
+        frame_enh = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
+        hsv    = cv2.cvtColor(frame_enh, cv2.COLOR_BGR2HSV)
+        h_ch, s_ch, v_ch = cv2.split(hsv)
+        v_ch   = cv2.createCLAHE(clipLimit=2.0,
+                                   tileGridSize=(8, 8)).apply(v_ch)
+        hsv    = cv2.merge((h_ch, s_ch, v_ch))
+
+        gray_s = cv2.cvtColor(frame_enh, cv2.COLOR_BGR2GRAY)
+        gray_s = cv2.GaussianBlur(gray_s, (5, 5), 0)
+        kernel = np.ones((3, 3), np.uint8)
+
+        detections = {}
+
+        for color_name, ranges in GATE_COLOR_RANGES.items():
+            mask = None
+            for lower, upper in ranges:
+                temp = cv2.inRange(hsv, lower, upper)
+                mask = temp if mask is None else cv2.bitwise_or(mask, temp)
+
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,  kernel)
+
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if not contours:
+                continue
+
+            valid = [c for c in contours if cv2.contourArea(c) > 400]
+            if not valid:
+                continue
+
+            gate = max(valid, key=cv2.contourArea)
+            peri  = cv2.arcLength(gate, True)
+            approx = cv2.approxPolyDP(gate, 0.04 * peri, True)
+
+            if not (4 <= len(approx) <= 8):
+                continue
+
+            x, y, bw, bh = cv2.boundingRect(gate)
+            # Scale back to full res
+            x  = int(x  / scale)
+            y  = int(y  / scale)
+            bw = int(bw / scale)
+            bh = int(bh / scale)
+            cx_gate = x + bw // 2
+            cy_gate = y + bh // 2
+
+            detections[color_name] = {
+                "cx": cx_gate, "cy": cy_gate,
+                "bw": bw, "bh": bh,
+                "x": x, "y": y,
+            }
+
+        # Priority: green > red
+        assigned = None
+        for color in GATE_PREFERRED_ORDER:
+            if color in detections:
+                assigned = color
+                break
+
+        result = None
+        if assigned:
+            tgt = detections[assigned]
+            bw  = tgt["bw"]
+            bh  = tgt["bh"]
+            avg_size = (bw + bh) / 2
+
+            if GATE_FOCAL_LENGTH is None and avg_size > 0:
+                GATE_FOCAL_LENGTH = (avg_size * KNOWN_DISTANCE) / REAL_GATE_WIDTH
+
+            dist_cm = None
+            if GATE_FOCAL_LENGTH and avg_size > 0:
+                dist_cm = (REAL_GATE_WIDTH * GATE_FOCAL_LENGTH) / avg_size
+                GATE_DIST_BUFFER.append(dist_cm)
+                if len(GATE_DIST_BUFFER) > 5:
+                    GATE_DIST_BUFFER.pop(0)
+                dist_cm = sum(GATE_DIST_BUFFER) / len(GATE_DIST_BUFFER)
+
+            result = {
+                "color":    assigned,
+                "cx":       tgt["cx"],
+                "cy":       tgt["cy"],
+                "bw":       bw,
+                "bh":       bh,
+                "x":        tgt["x"],
+                "y":        tgt["y"],
+                "dist_cm":  dist_cm,
+                "all":      detections,
+            }
+            print(f"[Gate] {assigned.upper()}  "
+                  f"X:{tgt['cx']}  Y:{tgt['cy']}  "
+                  f"Dist:{int(dist_cm) if dist_cm else '?'}cm")
+
+        force_put(gate_result_queue, (result, time.monotonic()))
 
 # ─────────────────────────────────────────────
 #  MAIN
@@ -445,6 +540,7 @@ def main():
     global last_qr_result,      last_qr_ts
     global last_balloon_result, last_balloon_ts
     global last_marker_result,  last_marker_ts
+    global last_gate_result,    last_gate_ts
     global last_target, lost_frames
 
     for i in range(len(ARUCO_DICTS)):
@@ -452,6 +548,7 @@ def main():
     threading.Thread(target=april_worker,   daemon=True).start()
     threading.Thread(target=qr_worker,      daemon=True).start()
     threading.Thread(target=balloon_worker, daemon=True).start()
+    threading.Thread(target=gate_worker,    daemon=True).start()
 
     print("[INFO] Integrated Detection — press Q to quit")
 
@@ -475,25 +572,24 @@ def main():
             enhanced = cv2.equalizeHist(gray)
             mode     = "DAY"
 
-        # Half-res for ArUco + April
         gray_s     = cv2.resize(gray,     (0, 0),
                                 fx=DETECT_SCALE, fy=DETECT_SCALE)
         enhanced_s = cv2.resize(enhanced, (0, 0),
                                 fx=DETECT_SCALE, fy=DETECT_SCALE)
+        frame_q    = cv2.resize(frame, (0, 0),
+                                fx=BALLOON_SCALE, fy=BALLOON_SCALE)
+        frame_g    = cv2.resize(frame, (0, 0),
+                                fx=GATE_SCALE, fy=GATE_SCALE)
 
-        # Quarter-res for balloon
-        frame_q = cv2.resize(frame, (0, 0),
-                             fx=BALLOON_SCALE, fy=BALLOON_SCALE)
-
-        # ── Feed all threads — always latest frame ──
+        # ── Feed all threads ──
         for q in aruco_input_queues:
             force_put(q, (gray_s, enhanced_s, DETECT_SCALE))
-
         force_put(april_input_queue,   (enhanced_s, DETECT_SCALE))
         force_put(qr_input_queue,      (gray.copy(), cx, cy))
         force_put(balloon_input_queue, (frame_q, BALLOON_SCALE, w, h))
+        force_put(gate_input_queue,    (frame_g, GATE_SCALE, w, h))
 
-        # ── Collect results ──
+        # ── Collect ArUco ──
         fresh_aruco = []
         while True:
             try:
@@ -530,7 +626,6 @@ def main():
                     if (pri, area) > best_score:
                         best_score = (pri, area)
                         best_r     = all_det[idx][4]
-
             if best_r:
                 last_marker_result = best_r
                 last_marker_ts     = now
@@ -538,6 +633,7 @@ def main():
                       f"ID:{best_r['aruco_id']}  "
                       f"X:{best_r['tx']}  Y:{best_r['ty']}")
 
+        # ── Collect AprilTag ──
         try:
             ap_res, ap_ts = april_result_queue.get_nowait()
             if ap_res is not None:
@@ -549,6 +645,7 @@ def main():
         except queue.Empty:
             pass
 
+        # ── Collect QR ──
         try:
             qr_res, qr_ts  = qr_result_queue.get_nowait()
             last_qr_result = qr_res
@@ -556,6 +653,7 @@ def main():
         except queue.Empty:
             pass
 
+        # ── Collect Balloon ──
         try:
             b_res, b_ts         = balloon_result_queue.get_nowait()
             last_balloon_result = b_res
@@ -563,13 +661,21 @@ def main():
         except queue.Empty:
             pass
 
+        # ── Collect Gate ──
+        try:
+            g_res, g_ts      = gate_result_queue.get_nowait()
+            last_gate_result = g_res
+            last_gate_ts     = g_ts
+        except queue.Empty:
+            pass
+
         # ════════════════════════════════════════════════════════════
-        #  PRIORITY: Marker → QR → Balloon
+        #  PRIORITY: Marker → QR → Balloon → Gate
         # ════════════════════════════════════════════════════════════
         detected      = None
         detect_source = ""
 
-        # 1. Marker
+        # 1. ArUco / AprilTag
         if (last_marker_result is not None and
                 (now - last_marker_ts) < MARKER_RESULT_TTL):
             r  = last_marker_result
@@ -628,9 +734,8 @@ def main():
 
                 cv2.putText(frame, f"BALLOON: {b_color}", (20, 95),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
-                cv2.putText(frame, f"Offset : {dist_m:.2f} m", (20, 125),
+                cv2.putText(frame, f"Offset: {dist_m:.2f}m", (20, 125),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-
                 if aligned:
                     cv2.putText(frame, "ALIGNED", (20, 155),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.85,
@@ -652,6 +757,78 @@ def main():
                 if (now - last_balloon_ts) >= BALLOON_RESULT_TTL:
                     last_balloon_result = None
 
+        # 4. Gate
+        if detected is None:
+            if (last_gate_result is not None and
+                    (now - last_gate_ts) < GATE_RESULT_TTL):
+                g   = last_gate_result
+                gcx = g["cx"]
+                gcy = g["cy"]
+                detected      = (gcx, gcy, f"Gate:{g['color'].upper()}")
+                detect_source = f"GATE-{g['color'].upper()}"
+
+                # Draw gate box
+                col = (0, 255, 0) if g["color"] == "green" else (0, 0, 255)
+                cv2.rectangle(frame,
+                              (g["x"], g["y"]),
+                              (g["x"] + g["bw"], g["y"] + g["bh"]),
+                              col, 2)
+                cv2.circle(frame, (gcx, gcy), 5, (0, 0, 255), -1)
+                cv2.line(frame, (cx, cy), (gcx, gcy), col, 2)
+
+                # Gate label
+                cv2.putText(frame,
+                            f"GATE: {g['color'].upper()}",
+                            (g["x"], g["y"] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2)
+
+                # Distance
+                if g["dist_cm"]:
+                    cv2.putText(frame,
+                                f"Dist: {int(g['dist_cm'])} cm",
+                                (20, 95),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                                (0, 255, 255), 2)
+
+                # Navigation offsets
+                dx_px  = gcx - cx
+                dy_px  = gcy - cy
+                ox     = dx_px / (w / 2)
+                oy     = -dy_px / (h / 2)
+                cv2.putText(frame, f"Offset X: {ox:.2f}", (20, 125),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                            (255, 255, 0), 2)
+                cv2.putText(frame, f"Offset Y: {oy:.2f}", (20, 155),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                            (255, 255, 0), 2)
+
+                # Gate command
+                gate_cmd = "CENTERED"
+                if abs(dx_px) > abs(dy_px):
+                    if dx_px > 40:
+                        gate_cmd = "MOVE RIGHT"
+                    elif dx_px < -40:
+                        gate_cmd = "MOVE LEFT"
+                else:
+                    if dy_px > 30:
+                        gate_cmd = "MOVE DOWN"
+                    elif dy_px < -30:
+                        gate_cmd = "MOVE UP"
+                cv2.putText(frame, f"GATE CMD: {gate_cmd}", (20, 185),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                            (255, 255, 255), 2)
+
+                # Both gates visible
+                if ("green" in g["all"] and "red" in g["all"]):
+                    cv2.putText(frame,
+                                "Prioritizing GREEN over RED",
+                                (20, 215),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                (0, 255, 0), 2)
+            else:
+                if (now - last_gate_ts) >= GATE_RESULT_TTL:
+                    last_gate_result = None
+
         # ════════════════════════════════════════════════════════════
         #  STABILITY FILTER
         # ════════════════════════════════════════════════════════════
@@ -665,6 +842,7 @@ def main():
                 last_qr_result      = None
                 last_balloon_result = None
                 last_marker_result  = None
+                last_gate_result    = None
 
         # ════════════════════════════════════════════════════════════
         #  DISPLAY
@@ -679,7 +857,7 @@ def main():
             cv2.putText(frame, f"dx:{dx:+d}  dy:{dy:+d}",
                         (tx - 20, ty + 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0), 1)
-            cv2.putText(frame, detect_source, (w - 200, 60),
+            cv2.putText(frame, detect_source, (w - 220, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 200), 2)
             status = ("CENTERED"
                       if abs(dx) < CENTER_TOLERANCE
@@ -690,8 +868,8 @@ def main():
             status, color = "NO TARGET", (0, 0, 255)
 
         # Crosshair
-        cv2.line(frame, (cx-25, cy), (cx+25, cy), (0, 255, 255), 2)
-        cv2.line(frame, (cx, cy-25), (cx, cy+25), (0, 255, 255), 2)
+        cv2.line(frame, (cx - 25, cy), (cx + 25, cy), (0, 255, 255), 2)
+        cv2.line(frame, (cx, cy - 25), (cx, cy + 25), (0, 255, 255), 2)
         cv2.circle(frame, (cx, cy), 4, (0, 255, 255), -1)
 
         # HUD
