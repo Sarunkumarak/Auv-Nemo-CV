@@ -89,7 +89,7 @@ HSV_RANGES = [
     (np.array([35,   80,  60]), np.array([85,  255, 255]), "GREEN"),
     (np.array([95,  100,  60]), np.array([140, 255, 255]), "BLUE"),
 ]
-HSV_NAMES    = [r[2] for r in HSV_RANGES]
+HSV_NAMES     = [r[2] for r in HSV_RANGES]
 _morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 BALLOON_MIN_AREA = 300
 BALLOON_CIRC_MIN = 0.60
@@ -253,6 +253,7 @@ def april_worker():
                 "label":  f"April {tag.tag_id}",
                 "source": "APRIL",
             }
+            print(f"[AprilTag] ID:{tag.tag_id}  X:{tx}  Y:{ty}")
             break
         force_put(april_result_queue, (result, time.monotonic()))
 
@@ -434,12 +435,12 @@ def gate_worker():
                                    tileGridSize=(8, 8)).apply(l)
         frame_enh = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
 
-        hsv_g       = cv2.cvtColor(frame_enh, cv2.COLOR_BGR2HSV)
+        hsv_g        = cv2.cvtColor(frame_enh, cv2.COLOR_BGR2HSV)
         h_ch, s_ch, v_ch = cv2.split(hsv_g)
-        v_ch        = cv2.createCLAHE(clipLimit=2.0,
-                                       tileGridSize=(8, 8)).apply(v_ch)
-        hsv_g       = cv2.merge((h_ch, s_ch, v_ch))
-        kernel      = np.ones((3, 3), np.uint8)
+        v_ch         = cv2.createCLAHE(clipLimit=2.0,
+                                        tileGridSize=(8, 8)).apply(v_ch)
+        hsv_g        = cv2.merge((h_ch, s_ch, v_ch))
+        kernel       = np.ones((3, 3), np.uint8)
 
         detections = {}
 
@@ -458,7 +459,6 @@ def gate_worker():
 
             if not contours:
                 continue
-
             valid = [c for c in contours if cv2.contourArea(c) > 400]
             if not valid:
                 continue
@@ -516,7 +516,6 @@ def gate_worker():
                 "dist_cm": dist_cm,
                 "all":     detections,
             }
-            # ── ONLY print when gate is detected ──
             print(f"[Gate] {assigned.upper()} DETECTED  "
                   f"X:{tgt['cx']}  Y:{tgt['cy']}  "
                   f"Dist:{int(dist_cm) if dist_cm else '?'}cm")
@@ -619,6 +618,9 @@ def main():
             if best_r:
                 last_marker_result = best_r
                 last_marker_ts     = now
+                print(f"[ArUco-{best_r['source'].split('-')[1]}] "
+                      f"ID:{best_r['aruco_id']}  "
+                      f"X:{best_r['tx']}  Y:{best_r['ty']}")
 
         # ── Collect AprilTag ──
         try:
@@ -690,6 +692,7 @@ def main():
                 cv2.putText(frame, f"{data[:30]}", (tx - 20, ty + 45),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                             (255, 255, 0), 2)
+                print(f"[QR] Data:{data}  X:{tx}  Y:{ty}")
             else:
                 if (now - last_qr_ts) >= QR_RESULT_TTL:
                     last_qr_result = None
