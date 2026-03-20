@@ -16,7 +16,7 @@ cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
 
 if not cap.isOpened():
-    print("[ERROR] Camera failed to open — check /dev/video0 exists")
+    print("[ERROR] Camera failed to open")
     exit(1)
 else:
     print(f"[INFO] Camera opened — "
@@ -24,7 +24,7 @@ else:
           f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
 
 # ─────────────────────────────────────────────
-#  ARUCO SETUP — one detector per dict
+#  ARUCO SETUP
 # ─────────────────────────────────────────────
 ARUCO_DICTS         = [aruco.DICT_4X4_1000, aruco.DICT_5X5_1000,
                        aruco.DICT_6X6_1000, aruco.DICT_7X7_1000]
@@ -50,12 +50,12 @@ aruco_detectors = [
 ]
 
 # ─────────────────────────────────────────────
-#  APRILTAG SETUP
+#  APRILTAG
 # ─────────────────────────────────────────────
 apriltag_detector = Detector(families="tag36h11")
 
 # ─────────────────────────────────────────────
-#  QR SETUP
+#  QR
 # ─────────────────────────────────────────────
 try:
     qr_detector = cv2.QRCodeDetectorAruco()
@@ -98,14 +98,15 @@ COLOR_RANGES = {
 #  TUNABLE CONSTANTS
 # ─────────────────────────────────────────────
 CENTER_TOLERANCE    = 60
-MAX_LOST            = 20
+MAX_LOST            = 8        # reduced — drop stale lock faster
 NIGHT_THRESHOLD     = 80
-MIN_MARKER_AREA     = 2000
+MIN_MARKER_AREA     = 500      # reduced for half-res
 MIN_QR_AREA         = 1500
-QR_RESULT_TTL       = 0.4
-MARKER_RESULT_TTL   = 0.12
+QR_RESULT_TTL       = 0.25     # tighter
+MARKER_RESULT_TTL   = 0.10     # tighter — stale results drop fast
 SPATIAL_MERGE_DIST  = 80
 ALIGNMENT_THRESHOLD = 30
+DETECT_SCALE        = 0.5      # ArUco + April run on half-res too
 
 # ─────────────────────────────────────────────
 #  SHARED DISPLAY FRAMES
@@ -127,11 +128,26 @@ last_target         = None
 lost_frames         = 0
 
 # ─────────────────────────────────────────────
+#  KEY HELPER — flush + put (always latest frame)
+# ─────────────────────────────────────────────
+def force_put(q, item):
+    """Drain queue then put — thread always gets the LATEST frame."""
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            break
+    try:
+        q.put_nowait(item)
+    except queue.Full:
+        pass
+
+# ─────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────
-def is_valid_marker(pts):
+def is_valid_marker(pts, scale=1.0):
     area = cv2.contourArea(pts.astype(np.float32))
-    if area < MIN_MARKER_AREA:
+    if area < MIN_MARKER_AREA * (scale ** 2):
         return False
     sides = [np.linalg.norm(pts[(i+1) % 4] - pts[i]) for i in range(4)]
     mean  = np.mean(sides)
@@ -155,13 +171,10 @@ def is_balloon_contour(cnt, min_circularity=0.65):
     return (4 * np.pi * area / (perim ** 2)) > min_circularity
 
 # ─────────────────────────────────────────────
-#  ARUCO THREADS — one per dictionary
-#  All 4 post into the SAME result queue.
-#  Main loop picks the highest-priority result.
+#  ARUCO THREADS — one per dict, half-res input
 # ─────────────────────────────────────────────
-# One input queue per dict, one shared result queue
-aruco_input_queues  = [queue.Queue(maxsize=1) for _ in ARUCO_DICTS]
-aruco_result_queue  = queue.Queue(maxsize=4)   # up to 4 results per frame
+aruco_input_queues = [queue.Queue(maxsize=2) for _ in ARUCO_DICTS]
+aruco_result_queue = queue.Queue(maxsize=8)
 
 def make_aruco_worker(det_idx):
     detector  = aruco_detectors[det_idx]
@@ -172,23 +185,26 @@ def make_aruco_worker(det_idx):
     def worker():
         while True:
             try:
-                gray, enhanced = in_q.get(timeout=1.0)
+                gray_s, enhanced_s, scale = in_q.get(timeout=1.0)
             except queue.Empty:
                 continue
 
-            corners, ids, _ = detector.detectMarkers(enhanced)
+            corners, ids, _ = detector.detectMarkers(enhanced_s)
             if ids is None:
-                corners, ids, _ = detector.detectMarkers(gray)
+                corners, ids, _ = detector.detectMarkers(gray_s)
             if ids is None or len(ids) == 0:
                 continue
 
+            ts = time.monotonic()
             for i in range(len(ids)):
                 c = corners[i][0]
-                if not is_valid_marker(c):
+                if not is_valid_marker(c, scale):
                     continue
                 area = cv2.contourArea(c)
-                tx   = int(c[:, 0].mean())
-                ty   = int(c[:, 1].mean())
+                # Scale coords back to full res
+                tx   = int(c[:, 0].mean() / scale)
+                ty   = int(c[:, 1].mean() / scale)
+                corner_full = (corners[i] / scale).astype(np.float32)
                 result = {
                     "type":     "ARUCO",
                     "priority": priority,
@@ -197,33 +213,33 @@ def make_aruco_worker(det_idx):
                     "label":    f"ArUco {dict_name}:{int(ids[i][0])}",
                     "source":   f"ARUCO-{dict_name}",
                     "aruco_id": int(ids[i][0]),
-                    "corner":   corners[i].copy(),
+                    "corner":   corner_full,
                     "aid":      ids[i].copy(),
                 }
                 try:
-                    aruco_result_queue.put_nowait((result, time.monotonic()))
+                    aruco_result_queue.put_nowait((result, ts))
                 except queue.Full:
                     pass
     return worker
 
 # ─────────────────────────────────────────────
-#  APRILTAG THREAD
+#  APRILTAG THREAD — half-res input
 # ─────────────────────────────────────────────
-april_input_queue  = queue.Queue(maxsize=1)
-april_result_queue = queue.Queue(maxsize=1)
+april_input_queue  = queue.Queue(maxsize=2)
+april_result_queue = queue.Queue(maxsize=2)
 
 def april_worker():
     while True:
         try:
-            enhanced = april_input_queue.get(timeout=1.0)
+            enhanced_s, scale = april_input_queue.get(timeout=1.0)
         except queue.Empty:
             continue
 
-        tags = apriltag_detector.detect(enhanced)
+        tags   = apriltag_detector.detect(enhanced_s)
         result = None
         for tag in tags:
-            tx = int(tag.center[0])
-            ty = int(tag.center[1])
+            tx = int(tag.center[0] / scale)
+            ty = int(tag.center[1] / scale)
             result = {
                 "type":   "APRIL",
                 "tx": tx, "ty": ty,
@@ -233,20 +249,14 @@ def april_worker():
             print(f"[AprilTag] ID:{tag.tag_id}  X:{tx}  Y:{ty}")
             break
 
-        if not april_result_queue.full():
-            april_result_queue.put((result, time.monotonic()))
-        else:
-            try:
-                april_result_queue.get_nowait()
-            except queue.Empty:
-                pass
-            april_result_queue.put((result, time.monotonic()))
+        # Always push (flush old first)
+        force_put(april_result_queue, (result, time.monotonic()))
 
 # ─────────────────────────────────────────────
 #  QR THREAD
 # ─────────────────────────────────────────────
-qr_input_queue  = queue.Queue(maxsize=1)
-qr_result_queue = queue.Queue(maxsize=1)
+qr_input_queue  = queue.Queue(maxsize=2)
+qr_result_queue = queue.Queue(maxsize=2)
 
 def preprocess_for_qr(gray):
     sharp = cv2.filter2D(gray, -1, SHARPEN_KERNEL)
@@ -308,20 +318,13 @@ def qr_worker():
             if r is not None:
                 tx, ty, data, pts = r
                 result = (tx * 2, ty * 2, data, (pts * 2).astype(int))
-        if not qr_result_queue.full():
-            qr_result_queue.put((result, time.monotonic()))
-        else:
-            try:
-                qr_result_queue.get_nowait()
-            except queue.Empty:
-                pass
-            qr_result_queue.put((result, time.monotonic()))
+        force_put(qr_result_queue, (result, time.monotonic()))
 
 # ─────────────────────────────────────────────
 #  BALLOON THREAD
 # ─────────────────────────────────────────────
-balloon_input_queue  = queue.Queue(maxsize=1)
-balloon_result_queue = queue.Queue(maxsize=1)
+balloon_input_queue  = queue.Queue(maxsize=2)
+balloon_result_queue = queue.Queue(maxsize=2)
 
 def balloon_worker():
     global shared_balloon_mask, shared_balloon_edges
@@ -402,14 +405,7 @@ def balloon_worker():
                 (best_contour.astype(np.float32) / scale).astype(np.int32)
             )
 
-        if not balloon_result_queue.full():
-            balloon_result_queue.put((result, time.monotonic()))
-        else:
-            try:
-                balloon_result_queue.get_nowait()
-            except queue.Empty:
-                pass
-            balloon_result_queue.put((result, time.monotonic()))
+        force_put(balloon_result_queue, (result, time.monotonic()))
 
 # ─────────────────────────────────────────────
 #  MAIN
@@ -422,8 +418,7 @@ def main():
 
     # Start all threads
     for i in range(len(ARUCO_DICTS)):
-        threading.Thread(
-            target=make_aruco_worker(i), daemon=True).start()
+        threading.Thread(target=make_aruco_worker(i), daemon=True).start()
     threading.Thread(target=april_worker,   daemon=True).start()
     threading.Thread(target=qr_worker,      daemon=True).start()
     threading.Thread(target=balloon_worker, daemon=True).start()
@@ -440,7 +435,6 @@ def main():
         cx, cy = w // 2, h // 2
         now    = time.monotonic()
 
-        # ── Minimal main-thread prep ──
         gray       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         brightness = cv2.mean(gray)[0]
 
@@ -451,42 +445,29 @@ def main():
             enhanced = cv2.equalizeHist(gray)
             mode     = "DAY"
 
-        # ════════════════════════════════════════════════════════════
-        #  FEED ALL THREADS — non-blocking, drop if busy
-        # ════════════════════════════════════════════════════════════
-        gray_copy     = gray.copy()
-        enhanced_copy = enhanced.copy()
+        # ── Half-res for marker detection ──
+        gray_s     = cv2.resize(gray,     (0, 0),
+                                fx=DETECT_SCALE, fy=DETECT_SCALE)
+        enhanced_s = cv2.resize(enhanced, (0, 0),
+                                fx=DETECT_SCALE, fy=DETECT_SCALE)
 
+        # ════════════════════════════════════════════════════════════
+        #  FEED ALL THREADS — force_put = always latest frame, no stale
+        # ════════════════════════════════════════════════════════════
         for q in aruco_input_queues:
-            if q.empty():
-                try:
-                    q.put_nowait((gray_copy, enhanced_copy))
-                except queue.Full:
-                    pass
+            force_put(q, (gray_s, enhanced_s, DETECT_SCALE))
 
-        if april_input_queue.empty():
-            try:
-                april_input_queue.put_nowait(enhanced_copy)
-            except queue.Full:
-                pass
-
-        if qr_input_queue.empty():
-            try:
-                qr_input_queue.put_nowait((gray_copy, cx, cy))
-            except queue.Full:
-                pass
-
-        if balloon_input_queue.empty():
-            try:
-                small = cv2.resize(
-                    frame, (0, 0), fx=BALLOON_SCALE, fy=BALLOON_SCALE)
-                balloon_input_queue.put_nowait((small, BALLOON_SCALE, w, h))
-            except queue.Full:
-                pass
+        force_put(april_input_queue,   (enhanced_s, DETECT_SCALE))
+        force_put(qr_input_queue,      (gray.copy(), cx, cy))
+        force_put(balloon_input_queue, (
+            cv2.resize(frame, (0, 0), fx=BALLOON_SCALE, fy=BALLOON_SCALE),
+            BALLOON_SCALE, w, h))
 
         # ════════════════════════════════════════════════════════════
-        #  COLLECT ARUCO RESULTS — drain queue, pick best by priority
+        #  COLLECT RESULTS
         # ════════════════════════════════════════════════════════════
+
+        # Drain ALL fresh ArUco results, pick best
         fresh_aruco = []
         while True:
             try:
@@ -496,7 +477,6 @@ def main():
             except queue.Empty:
                 break
 
-        # Resolve conflicts — group spatially, pick highest priority+area
         if fresh_aruco:
             all_det = [(r["priority"], r["area"],
                         r["tx"], r["ty"], r) for r, _ in fresh_aruco]
@@ -532,11 +512,10 @@ def main():
                       f"ID:{best_r['aruco_id']}  "
                       f"X:{best_r['tx']}  Y:{best_r['ty']}")
 
-        # Collect AprilTag
+        # AprilTag
         try:
             ap_res, ap_ts = april_result_queue.get_nowait()
             if ap_res is not None:
-                # Only use AprilTag if no fresh ArUco
                 if (last_marker_result is None or
                         last_marker_result["type"] != "ARUCO" or
                         (now - last_marker_ts) >= MARKER_RESULT_TTL):
@@ -545,7 +524,7 @@ def main():
         except queue.Empty:
             pass
 
-        # Collect QR
+        # QR
         try:
             qr_res, qr_ts  = qr_result_queue.get_nowait()
             last_qr_result = qr_res
@@ -553,7 +532,7 @@ def main():
         except queue.Empty:
             pass
 
-        # Collect Balloon
+        # Balloon
         try:
             b_res, b_ts         = balloon_result_queue.get_nowait()
             last_balloon_result = b_res
@@ -562,7 +541,7 @@ def main():
             pass
 
         # ════════════════════════════════════════════════════════════
-        #  PRIORITY: ArUco/April → QR → Balloon
+        #  PRIORITY: Marker → QR → Balloon
         # ════════════════════════════════════════════════════════════
         detected      = None
         detect_source = ""
