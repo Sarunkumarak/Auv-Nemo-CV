@@ -5,39 +5,11 @@ import numpy as np
 import threading
 import queue
 import time
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import String
-from geometry_msgs.msg import Point
 
 # ─────────────────────────────────────────────
-#  CAMERA — GStreamer with fallback
+#  CAMERA
 # ─────────────────────────────────────────────
-def open_camera():
-    # Try GStreamer first
-    gst_pipeline = (
-        "v4l2src device=/dev/video0 ! "
-        "video/x-raw, width=1280, height=720, framerate=30/1 ! "
-        "videoconvert ! "
-        "video/x-raw, format=BGR ! "
-        "appsink drop=1"
-    )
-    cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
-    if cap.isOpened():
-        print("[INFO] Camera opened with GStreamer")
-        return cap
-
-    # Fallback to normal OpenCV
-    print("[WARN] GStreamer failed — falling back to normal capture")
-    cap = cv2.VideoCapture(0)
-    if cap.isOpened():
-        print("[INFO] Camera opened with default backend")
-        return cap
-
-    print("[ERROR] Cannot open camera at all")
-    exit(1)
-
-cap = open_camera()
+cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
@@ -130,11 +102,21 @@ SPATIAL_MERGE_DIST  = 80
 ALIGNMENT_THRESHOLD = 30
 
 # ─────────────────────────────────────────────
-#  SHARED DISPLAY FRAMES
+#  SHARED DISPLAY FRAMES (thread → main)
 # ─────────────────────────────────────────────
 display_lock         = threading.Lock()
 shared_balloon_mask  = None
 shared_balloon_edges = None
+
+# ─────────────────────────────────────────────
+#  MUTABLE GLOBALS (written by main, read by workers)
+# ─────────────────────────────────────────────
+last_qr_result      = None
+last_qr_ts          = 0.0
+last_balloon_result = None
+last_balloon_ts     = 0.0
+last_target         = None
+lost_frames         = 0
 
 # ─────────────────────────────────────────────
 #  QR BACKGROUND THREAD
@@ -168,7 +150,7 @@ def try_detect_qr(img, cx, cy):
                     best_dist = dist
                     best_i    = i
             if best_i >= 0:
-                pts  = pts_list[best_i].astype(int)
+                pts    = pts_list[best_i].astype(int)
                 result = (int(pts[:, 0].mean()), int(pts[:, 1].mean()),
                           data_list[best_i], pts)
     except Exception:
@@ -209,8 +191,6 @@ def qr_worker():
             except queue.Empty:
                 pass
             qr_result_queue.put((result, time.monotonic()))
-
-threading.Thread(target=qr_worker, daemon=True).start()
 
 # ─────────────────────────────────────────────
 #  BALLOON BACKGROUND THREAD
@@ -321,8 +301,6 @@ def balloon_worker():
                 pass
             balloon_result_queue.put((result, time.monotonic()))
 
-threading.Thread(target=balloon_worker, daemon=True).start()
-
 # ─────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────
@@ -345,33 +323,23 @@ def is_valid_marker(pts):
     return True
 
 # ─────────────────────────────────────────────
-#  ROS2 NODE
+#  MAIN
 # ─────────────────────────────────────────────
-class DetectionNode(Node):
-    def __init__(self):
-        super().__init__('balloon_tags_node')
+def main():
+    global last_qr_result, last_qr_ts
+    global last_balloon_result, last_balloon_ts
+    global last_target, lost_frames
 
-        self.pub_label  = self.create_publisher(String, '/detection/label',  10)
-        self.pub_offset = self.create_publisher(Point,  '/detection/offset', 10)
-        self.pub_source = self.create_publisher(String, '/detection/source', 10)
+    # Start background threads
+    threading.Thread(target=qr_worker,      daemon=True).start()
+    threading.Thread(target=balloon_worker, daemon=True).start()
 
-        self.last_target         = None
-        self.lost_frames         = 0
-        self.last_qr_result      = None
-        self.last_qr_ts          = 0.0
-        self.last_balloon_result = None
-        self.last_balloon_ts     = 0.0
+    print("[INFO] Integrated Detection — press Q to quit")
 
-        self.timer = self.create_timer(0.033, self.loop)
-        self.get_logger().info("DetectionNode started — press Q in window to quit")
-
-    def loop(self):
-        global shared_balloon_mask, shared_balloon_edges
-
+    while True:
         ret, frame = cap.read()
         if not ret:
-            self.get_logger().warn("Camera read failed")
-            return
+            break
 
         h, w   = frame.shape[:2]
         cx, cy = w // 2, h // 2
@@ -391,7 +359,9 @@ class DetectionNode(Node):
         detect_source = ""
         marker_found  = False
 
-        # ── 1. ARUCO ──
+        # ════════════════════════════════════════════════════════════
+        #  1. ARUCO
+        # ════════════════════════════════════════════════════════════
         all_detections = []
         for det_i, aruco_detector in enumerate(aruco_detectors):
             corners, ids, _ = aruco_detector.detectMarkers(enhanced)
@@ -444,9 +414,11 @@ class DetectionNode(Node):
                 detect_source = f"ARUCO-{dict_name}"
                 marker_found  = True
                 aruco.drawDetectedMarkers(frame, [corner], np.array([[aruco_id]]))
-                self.get_logger().info(f"[ArUco-{dict_name}] ID:{aruco_id}  X:{tx}  Y:{ty}")
+                print(f"[ArUco-{dict_name}] ID:{aruco_id}  X:{tx}  Y:{ty}")
 
-        # ── 2. APRILTAG ──
+        # ════════════════════════════════════════════════════════════
+        #  2. APRILTAG
+        # ════════════════════════════════════════════════════════════
         if not marker_found:
             tags = apriltag_detector.detect(enhanced)
             for tag in tags:
@@ -454,10 +426,12 @@ class DetectionNode(Node):
                 detected      = (tx, ty, f"April {tag.tag_id}")
                 detect_source = "APRIL"
                 marker_found  = True
-                self.get_logger().info(f"[AprilTag] ID:{tag.tag_id}  X:{tx}  Y:{ty}")
+                print(f"[AprilTag] ID:{tag.tag_id}  X:{tx}  Y:{ty}")
                 break
 
-        # ── 3. QR ──
+        # ════════════════════════════════════════════════════════════
+        #  3. QR
+        # ════════════════════════════════════════════════════════════
         if not marker_found:
             if qr_input_queue.empty():
                 try:
@@ -465,14 +439,14 @@ class DetectionNode(Node):
                 except queue.Full:
                     pass
             try:
-                qr_res, qr_ts       = qr_result_queue.get_nowait()
-                self.last_qr_result = qr_res
-                self.last_qr_ts     = qr_ts
+                qr_res, qr_ts  = qr_result_queue.get_nowait()
+                last_qr_result = qr_res
+                last_qr_ts     = qr_ts
             except queue.Empty:
                 pass
 
-            if self.last_qr_result is not None and (now - self.last_qr_ts) < QR_RESULT_TTL:
-                tx, ty, data, pts = self.last_qr_result
+            if last_qr_result is not None and (now - last_qr_ts) < QR_RESULT_TTL:
+                tx, ty, data, pts = last_qr_result
                 detected      = (tx, ty, f"QR:{data}")
                 detect_source = "QR"
                 marker_found  = True
@@ -481,12 +455,14 @@ class DetectionNode(Node):
                              tuple(pts[(i + 1) % len(pts)]), (0, 255, 0), 2)
                 cv2.putText(frame, f"{data[:30]}", (tx - 20, ty + 45),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
-                self.get_logger().info(f"[QR] Data:{data}  X:{tx}  Y:{ty}")
+                print(f"[QR] Data:{data}  X:{tx}  Y:{ty}")
             else:
-                if (now - self.last_qr_ts) >= QR_RESULT_TTL:
-                    self.last_qr_result = None
+                if (now - last_qr_ts) >= QR_RESULT_TTL:
+                    last_qr_result = None
 
-        # ── 4. BALLOON ──
+        # ════════════════════════════════════════════════════════════
+        #  4. BALLOON — always feed thread every frame
+        # ════════════════════════════════════════════════════════════
         if balloon_input_queue.empty():
             try:
                 small = cv2.resize(frame, (0, 0), fx=BALLOON_SCALE, fy=BALLOON_SCALE)
@@ -495,30 +471,29 @@ class DetectionNode(Node):
                 pass
 
         try:
-            b_res, b_ts              = balloon_result_queue.get_nowait()
-            self.last_balloon_result = b_res
-            self.last_balloon_ts     = b_ts
+            b_res, b_ts         = balloon_result_queue.get_nowait()
+            last_balloon_result = b_res
+            last_balloon_ts     = b_ts
         except queue.Empty:
             pass
 
         if not marker_found:
-            if self.last_balloon_result is not None and \
-               (now - self.last_balloon_ts) < BALLOON_RESULT_TTL:
-                b_center, b_radius, b_color, b_contour = self.last_balloon_result
+            if last_balloon_result is not None and (now - last_balloon_ts) < BALLOON_RESULT_TTL:
+                b_center, b_radius, b_color, b_contour = last_balloon_result
                 bx, by = b_center
                 dx_px  = bx - cx
                 dy_px  = cy - by
 
                 meters_per_pixel = BALLOON_DIAMETER_M / (2 * b_radius + 1e-6)
-                dx_m   = dx_px * meters_per_pixel
-                dy_m   = dy_px * meters_per_pixel
-                dist_m = np.sqrt(dx_m ** 2 + dy_m ** 2)
+                dx_m    = dx_px * meters_per_pixel
+                dy_m    = dy_px * meters_per_pixel
+                dist_m  = np.sqrt(dx_m ** 2 + dy_m ** 2)
                 aligned = (abs(dx_px) <= ALIGNMENT_THRESHOLD and
                            abs(dy_px) <= ALIGNMENT_THRESHOLD)
 
                 detected      = (bx, by, f"Balloon:{b_color}")
                 detect_source = "BALLOON"
-                self.get_logger().info(f"[Balloon] {b_color}  X:{bx}  Y:{by}")
+                print(f"[Balloon] {b_color}  X:{bx}  Y:{by}")
 
                 cv2.drawContours(frame, [b_contour], -1, (0, 255, 0), 2)
                 cv2.circle(frame, b_center, int(b_radius), (255, 0, 0), 2)
@@ -543,39 +518,28 @@ class DetectionNode(Node):
                                 (20, 155), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.75, (0, 0, 255), 2)
             else:
-                if (now - self.last_balloon_ts) >= BALLOON_RESULT_TTL:
-                    self.last_balloon_result = None
+                if (now - last_balloon_ts) >= BALLOON_RESULT_TTL:
+                    last_balloon_result = None
 
-        # ── Stability Filter ──
+        # ════════════════════════════════════════════════════════════
+        #  STABILITY FILTER
+        # ════════════════════════════════════════════════════════════
         if detected is not None:
-            self.last_target = detected
-            self.lost_frames = 0
+            last_target = detected
+            lost_frames = 0
         else:
-            self.lost_frames += 1
-            if self.lost_frames >= MAX_LOST:
-                self.last_target         = None
-                self.last_qr_result      = None
-                self.last_balloon_result = None
+            lost_frames += 1
+            if lost_frames >= MAX_LOST:
+                last_target         = None
+                last_qr_result      = None
+                last_balloon_result = None
 
-        # ── Publish to ROS2 ──
-        if self.last_target is not None and self.lost_frames < MAX_LOST:
-            tx, ty, label = self.last_target
+        # ════════════════════════════════════════════════════════════
+        #  DISPLAY
+        # ════════════════════════════════════════════════════════════
+        if last_target is not None and lost_frames < MAX_LOST:
+            tx, ty, label = last_target
             dx, dy = tx - cx, ty - cy
-
-            msg_label       = String()
-            msg_label.data  = label
-            self.pub_label.publish(msg_label)
-
-            msg_offset   = Point()
-            msg_offset.x = float(dx)
-            msg_offset.y = float(dy)
-            msg_offset.z = 0.0
-            self.pub_offset.publish(msg_offset)
-
-            msg_source      = String()
-            msg_source.data = detect_source
-            self.pub_source.publish(msg_source)
-
             cv2.circle(frame, (tx, ty), 6, (0, 255, 0), -1)
             cv2.line(frame, (cx, cy), (tx, ty), (0, 255, 0), 2)
             cv2.putText(frame, label, (tx - 20, ty - 22),
@@ -584,8 +548,7 @@ class DetectionNode(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0), 1)
             cv2.putText(frame, detect_source, (w - 200, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 200), 2)
-            status = "CENTERED" if abs(dx) < CENTER_TOLERANCE and \
-                                   abs(dy) < CENTER_TOLERANCE else "NOT CENTERED"
+            status = "CENTERED" if abs(dx) < CENTER_TOLERANCE and abs(dy) < CENTER_TOLERANCE else "NOT CENTERED"
             color  = (0, 255, 0) if status == "CENTERED" else (0, 0, 255)
         else:
             status, color = "NO TARGET", (0, 0, 255)
@@ -602,33 +565,21 @@ class DetectionNode(Node):
         cv2.putText(frame, status, (30, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, 3)
 
+        # ── Show all windows ──
         cv2.imshow("Integrated Detection", frame)
 
         with display_lock:
             if shared_balloon_mask is not None:
                 cv2.imshow("Balloon Mask", shared_balloon_mask)
             if shared_balloon_edges is not None:
-                cv2.imshow("Edges", shared_balloon_edges)
+                cv2.imshow("Balloon Edges", shared_balloon_edges)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            rclpy.shutdown()
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
 
 
-# ─────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────
-def main(args=None):
-    rclpy.init(args=args)
-    node = DetectionNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        cap.release()
-        cv2.destroyAllWindows()
-        rclpy.shutdown()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
