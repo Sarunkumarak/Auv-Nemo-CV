@@ -6,14 +6,23 @@ import threading
 import queue
 import time
 
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+from cv_bridge import CvBridge
+
 # ─────────────────────────────────────────────
 #  CAMERA
 # ─────────────────────────────────────────────
-cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
-cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
+gst_pipeline = (
+    "v4l2src device=/dev/video0 ! "
+    "video/x-raw, format=YUY2, width=640, height=480, framerate=30/1 ! "
+    "videoconvert ! "
+    "video/x-raw, format=BGR ! "
+    "appsink drop=True max-buffers=1 emit-signals=True sync=False"
+)
+
+cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
 
 if not cap.isOpened():
     print("[ERROR] Camera failed to open")
@@ -145,6 +154,9 @@ last_gate_result    = None
 last_gate_ts        = 0.0
 last_target         = None
 lost_frames         = 0
+
+# Shared publisher reference (set by ROS2 node)
+ros_publisher       = None
 
 # ─────────────────────────────────────────────
 #  force_put
@@ -523,14 +535,15 @@ def gate_worker():
         force_put(gate_result_queue, (result, time.monotonic()))
 
 # ─────────────────────────────────────────────
-#  MAIN
+#  DETECTION MAIN LOOP  ← renamed from main()
 # ─────────────────────────────────────────────
-def main():
+def detection_main():
     global last_qr_result,      last_qr_ts
     global last_balloon_result, last_balloon_ts
     global last_marker_result,  last_marker_ts
     global last_gate_result,    last_gate_ts
     global last_target, lost_frames
+    global ros_publisher
 
     for i in range(len(ARUCO_DICTS)):
         threading.Thread(target=make_aruco_worker(i), daemon=True).start()
@@ -826,6 +839,15 @@ def main():
                 last_gate_result    = None
 
         # ════════════════════════════════════════════════════════════
+        #  PUBLISH TO ROS2
+        # ════════════════════════════════════════════════════════════
+        if ros_publisher is not None and last_target is not None:
+            tx, ty, label = last_target
+            msg = String()
+            msg.data = f"{label} X:{tx} Y:{ty} SRC:{detect_source}"
+            ros_publisher.publish(msg)
+
+        # ════════════════════════════════════════════════════════════
         #  DISPLAY
         # ════════════════════════════════════════════════════════════
         if last_target is not None and lost_frames < MAX_LOST:
@@ -861,13 +883,14 @@ def main():
         cv2.putText(frame, status, (30, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, 3)
 
+        # ── Show all windows ──
         cv2.imshow("Integrated Detection", frame)
 
         with display_lock:
             if shared_balloon_mask is not None:
-                cv2.imshow("Balloon Mask",  shared_balloon_mask)
+                cv2.imshow("Balloon Mask", shared_balloon_mask)
             if shared_balloon_edges is not None:
-                cv2.imshow("Balloon Edges", shared_balloon_edges)
+                cv2.imshow("Edges", shared_balloon_edges)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -875,6 +898,33 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
 
+# ─────────────────────────────────────────────
+#  ROS2 NODE
+# ─────────────────────────────────────────────
+class DetectionNode(Node):
+    def __init__(self):                          # ← double underscores FIXED
+        super().__init__('detection_node')       # ← double underscores FIXED
 
-if __name__ == "__main__":
+        self.publisher_ = self.create_publisher(String, '/detections/target', 10)
+
+        # Share publisher with detection loop
+        global ros_publisher
+        ros_publisher = self.publisher_
+
+        # Start full detection loop in background thread
+        self.det_thread = threading.Thread(target=detection_main, daemon=True)
+        self.det_thread.start()
+
+        self.get_logger().info("Detection node started!")
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DetectionNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == "__main__":                       # ← double underscores FIXED
     main()
